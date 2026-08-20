@@ -578,11 +578,32 @@ class CsNewsPlugin(Star):
             return default
         return max(lo, min(hi, v))
 
+    def _resolve_group_key(self, event: AstrMessageEvent) -> str | None:
+        """从事件提取当前群号，映射到 _pushed_by / targets 里的目标 key。
+
+        unified_msg_origin 形如 "MyBot:GroupMessage:群号"，末段即群号。
+        优先精确匹配；兼容完整 session 格式（以 :群号 结尾）。
+        """
+        origin = getattr(event, "unified_msg_origin", "") or ""
+        gid = origin.split(":")[-1] if ":" in origin else ""
+        if not gid:
+            return None
+        keys = self._pushed_by if self._pushed_by else {}
+        if gid in keys:
+            return gid
+        for t in keys:
+            if t == gid or t.endswith(":" + gid):
+                return t
+        for t in self.targets:
+            if t == gid or t.endswith(":" + gid):
+                return t
+        return None
+
     # ---------------- 手动指令（便于调试/手动触发） ----------------
 
     @filter.command("csnews")
     async def csnews(self, event: AstrMessageEvent):
-        """CS 赛事新闻助手管理：/csnews push 立即轮询推送；/csnews status 查看状态。"""
+        """CS 赛事新闻助手管理：/csnews push 立即轮询推送；/csnews status 查看当前群状态；/csnews reset 清空当前群已推送记录。"""
         async for r in self._handle_command(event, "csnews"):
             yield r
 
@@ -619,6 +640,8 @@ class CsNewsPlugin(Star):
         if action == "status":
             state = "运行中" if self._running else "已停用"
             grade_desc = self._grade_desc()
+            key = self._resolve_group_key(event)
+            cur_count = len(self._pushed_by.get(key, set())) if key else 0
             lines = [
                 f"状态：{state}",
                 f"轮询间隔：{self.interval_min} 分钟",
@@ -627,13 +650,27 @@ class CsNewsPlugin(Star):
                 f"推送目标：{self.targets or '(未配置)'}",
                 f"赛事等级筛选：{','.join(self.match_grades)}（{grade_desc}）",
                 f"附今日赛事：{'开' if self.enable_match else '关'}",
-                f"已推送累计：{self._pushed_total} 条",
-                f"去重记录：{len(self._ad_seen)} 条广告 + "
-                f"{sum(len(s) for s in self._pushed_by.values())} 条新闻",
-                f"各群已推送：{('，'.join(f'{t}:{len(s)}' for t, s in self._pushed_by.items())) or '(无)'}",
+                f"当前群已推送记录：{cur_count} 条",
+                f"广告过滤累计：{len(self._ad_seen)} 条",
             ]
+            if key is None:
+                lines.append("（当前群不在推送目标中）")
             yield event.plain_result("\n".join(lines))
             return
+        if action == "reset":
+            key = self._resolve_group_key(event)
+            if key is None:
+                yield event.plain_result("当前群不在推送目标中，无法定位推送记录。")
+                return
+            n = len(self._pushed_by.get(key, set()))
+            self._pushed_by[key] = set()
+            self._save_state()
+            yield event.plain_result(
+                f"已清空当前群的已推送记录（{key}），共 {n} 条。"
+                "下次轮询将重新推送窗口内的新闻。"
+            )
+            return
         yield event.plain_result(
-            f"用法：/{cmd} push 立即轮询推送；/{cmd} status 查看状态"
+            f"用法：/{cmd} push 立即轮询推送；/{cmd} status 查看当前群状态；"
+            f"/{cmd} reset 清空当前群已推送记录"
         )
