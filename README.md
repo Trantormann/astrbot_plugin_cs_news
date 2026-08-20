@@ -1,4 +1,4 @@
-# astrbot_plugin_hltv_news
+# astrbot_plugin_cs_news
 
 **CS 赛事新闻助手** —— CS2（CSGO）电竞新闻与今日赛事定时播报插件。数据源为 [5eplay（5EPLAY）中文站](https://csgo.5eplay.com)，定时轮询新闻接口抓取最新中文新闻，并在推送新闻时自动附上今日（北京时间）S/A 级赛事预告，推送到指定 QQ 群。
 
