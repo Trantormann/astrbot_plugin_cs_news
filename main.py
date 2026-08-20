@@ -23,7 +23,7 @@ import asyncio
 import html
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +68,7 @@ class CsNewsPlugin(Star):
         self.enable_match = bool(self.config.get("enable_match_push", True))
         self.ua = str(self.config.get("user_agent", DEFAULT_UA))
         self.timeout = self._clamp_int("fetch_timeout", 25, 5, 120)
+        self.lookback_hours = self._clamp_int("lookback_hours", 24, 1, 720)
         self.fail_threshold = self._clamp_int("llm_fail_threshold", 3, 1, 20)
         self.provider_id = str(self.config.get("llm_provider_id", "")).strip()
 
@@ -175,7 +176,32 @@ class CsNewsPlugin(Star):
             reverse=True,
         )
 
-        pending = [it for it in items if it["id"] not in self._seen_ids]
+        # 只推最近 lookback_hours 内发布的新闻，避免反复向前翻旧闻。
+        # pub_dt 无法解析的条目直接跳过并记入已处理，防止每轮重复请求。
+        cutoff = datetime.now(CST) - timedelta(hours=self.lookback_hours)
+        in_window: list[dict] = []
+        for it in items:
+            d = it.get("pub_dt")
+            if d is None:
+                self._seen_ids.add(it["id"])
+                logger.debug("[cs_news] 跳过无发布时间条目: %s", it["title"])
+                continue
+            if d >= cutoff:
+                in_window.append(it)
+            else:
+                logger.debug(
+                    "[cs_news] 窗口外旧闻不推: %s (%s)",
+                    it["title"],
+                    d.strftime("%m-%d %H:%M"),
+                )
+        logger.info(
+            "[cs_news] 新闻共 %s 条，窗口内(最近 %sh) %s 条",
+            len(items),
+            self.lookback_hours,
+            len(in_window),
+        )
+
+        pending = [it for it in in_window if it["id"] not in self._seen_ids]
         if not pending:
             logger.debug("[cs_news] 暂无未推送的新新闻")
             return 0

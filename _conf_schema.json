@@ -86,5 +86,13 @@
     "type": "string",
     "hint": "去重记录等持久化数据存放目录（请使用 AstrBot data 目录，避免被插件更新覆盖）。",
     "default": "/opt/AstrBot/data"
+  },
+  "lookback_hours": {
+    "description": "只推送最近 N 小时内发布的新闻",
+    "type": "int",
+    "hint": "防止反复向前翻找未推送过的旧闻。默认 24；CS 新闻时效性强，建议 6~24。",
+    "default": 24,
+    "min": 1,
+    "max": 720
   }
 }

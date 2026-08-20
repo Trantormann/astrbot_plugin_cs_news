@@ -11,7 +11,7 @@ desc: |
   - LLM 不可用时直接报错停用，绝不污染主对话上下文
 short_desc: CS2 电竞新闻与今日赛事定时播报（5eplay 数据源）。
 author: Trantormann
-version: 2.2.1
+version: 2.3.0
 repo: https://github.com/Trantormann/astrbot_plugin_cs_news
 tags:
   - CS2
