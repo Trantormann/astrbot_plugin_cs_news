@@ -543,12 +543,14 @@ class CsNewsPlugin(Star):
     @filter.command("csnews")
     async def csnews(self, event: AstrMessageEvent):
         """CS 赛事新闻助手管理：/csnews push 立即轮询推送；/csnews status 查看状态。"""
-        await self._handle_command(event, "csnews")
+        async for r in self._handle_command(event, "csnews"):
+            yield r
 
     @filter.command("hltv")
     async def hltv_alias(self, event: AstrMessageEvent):
         """旧指令别名，功能同 /csnews。"""
-        await self._handle_command(event, "csnews")
+        async for r in self._handle_command(event, "csnews"):
+            yield r
 
     async def _handle_command(self, event: AstrMessageEvent, cmd: str):
         """事件学习 + push/status 分发。"""
