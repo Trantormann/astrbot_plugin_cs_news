@@ -9,13 +9,13 @@
   "target_sessions": {
     "description": "推送目标群（群号或完整会话 ID，可多个）",
     "type": "list",
-    "hint": "每个元素填一个目标：推荐直接填 QQ 群号（如 168809677），插件会按 「显式 platform_id > 事件学习 > 自动探测」自动补全平台段，无需关心平台名；也可填完整会话 ID（如 Iris:GroupMessage:123456）。填写多个则同时推送。",
+    "hint": "每个元素填一个目标：推荐直接填 QQ 群号（如 123456），插件会按 「显式 platform_id > 事件学习 > 自动探测」自动补全平台段，无需关心平台名；也可填完整会话 ID（如 MyBot:GroupMessage:123456）。填写多个则同时推送。",
     "default": []
   },
   "platform_id": {
     "description": "推送平台实例 ID（可空，通用环境推荐留空）",
     "type": "string",
-    "hint": "留空即可：在目标群执行一次 /hltv 会自动学习平台 ID；多平台机器可显式指定（如 Iris）。格式见 /hltv status 输出的「平台 ID」。",
+    "hint": "留空即可：在目标群执行一次 /hltv 会自动学习平台 ID；多平台机器可显式指定（如 MyBot）。格式见 /hltv status 输出的「平台 ID」。",
     "default": ""
   },
   "llm_provider_id": {

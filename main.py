@@ -86,7 +86,7 @@ class HltvNewsPlugin(Star):
         self._provider_id_resolved = ""
         self._consecutive_llm_fail = 0
         self._pushed_total = 0
-        self._platform_id = ""  # 运行时解析到的实际平台实例 ID（如 Iris）：
+        self._platform_id = ""  # 运行时解析到的实际平台实例 ID（如 MyBot）：
         #    优先级：配置 platform_id > 事件学习(unified_msg_origin) > 自动探测 platform_insts
         self.config_platform_id = str(self.config.get("platform_id", "") or "").strip()
 
@@ -362,7 +362,7 @@ class HltvNewsPlugin(Star):
         return target
 
     def _detect_platform_id(self) -> str:
-        """探测实际平台实例 ID（platform.meta().id，如 'Iris'），供拼接会话使用。
+        """探测实际平台实例 ID（platform.meta().id，如 'MyBot'），供拼接会话使用。
         优先 aiocqhttp 类型实例；没有则取第一个可用平台实例。"""
         try:
             insts = self.context.platform_manager.platform_insts
@@ -419,7 +419,7 @@ class HltvNewsPlugin(Star):
     @filter.command("hltv")
     async def hltv(self, event: AstrMessageEvent):
         """HLTV 新闻播报管理：/hltv push 立即轮询推送；/hltv status 查看状态。"""
-        # 事件学习：从本条真实事件（unified_msg_origin 形如 "Iris:GroupMessage:群号"）
+        # 事件学习：从本条真实事件（unified_msg_origin 形如 "MyBot:GroupMessage:群号"）
         # 提取该群所在平台的实例 ID，优先于自动探测，保证纯群号补全准确。
         origin = getattr(event, "unified_msg_origin", "") or ""
         if ":" in origin:

@@ -27,8 +27,8 @@ HLTV（CS2 电竞）新闻定时播报插件。定时轮询 [HLTV 官方 RSS](ht
 | 配置项 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `poll_interval_minutes` | int | 30 | 轮询间隔（分钟），最小 5 |
-| `target_sessions` | list | `[]` | 推送目标群。推荐每项直接填**纯 QQ 群号**（如 `123456`），插件按「显式 `platform_id` > 事件学习 > 自动探测」补全平台段，**不绑定任何平台名**；也可填 `GroupMessage:群号` 或缺平台段的写法，或**完整会话 ID**（如 `Iris:GroupMessage:123456`）。可填多个，同时推送 |
-| `platform_id` | string | `""` | 推送平台实例 ID（可空）。留空即可——在目标群执行一次 `/hltv` 会自动学习真实平台 ID；多平台机器可显式指定（如 `Iris`）。通用环境无需设置 |
+| `target_sessions` | list | `[]` | 推送目标群。推荐每项直接填**纯 QQ 群号**（如 `123456`），插件按「显式 `platform_id` > 事件学习 > 自动探测」补全平台段，**不绑定任何平台名**；也可填 `GroupMessage:群号` 或缺平台段的写法，或**完整会话 ID**（如 `MyBot:GroupMessage:123456`）。可填多个，同时推送 |
+| `platform_id` | string | `""` | 推送平台实例 ID（可空）。留空即可——在目标群执行一次 `/hltv` 会自动学习真实平台 ID；多平台机器可显式指定（如 `MyBot`）。通用环境无需设置 |
 | `llm_provider_id` | string | 空 | 用于概括/翻译的 LLM 提供商；留空自动使用默认对话模型 |
 | `max_push_per_cycle` | int | 3 | 单轮最多推送条数（1~10） |
 | `summary_max_chars` | int | 50 | 中文概括字数上限（尽可能遵守，不绝对强制） |
