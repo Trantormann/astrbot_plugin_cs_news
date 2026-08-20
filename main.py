@@ -1,391 +1,326 @@
-"""
-astrbot_plugin_hltv_news
-========================
-HLTV（CS2 电竞）新闻定时播报插件。
+"""astrbot_plugin_hltv_news
 
-核心能力：
-- 每隔可配置的时间轮询 HLTV 官方 RSS（hltv.org/rss/news），抓取最新新闻。
-- 基于 RSS 稳定条目 ID 去重，只推送"先前未抓取过"的新闻；
-  单轮最多推送 max_push_per_cycle 条（默认 3 条）。
-- 用 LLM 先概括后翻译：中文标题 + ≤50 汉字中文概括，
-  并严格保留选手 ID / 真名 / 战队名 / 赛事名等专有名词不翻译。
-- 推送内容：头图 + 中文标题 + 发布时间（北京时间）+ 中文概括 + 原文链接，
-  QQ 群友好排版（emoji 点缀、不用 Markdown）。
-- LLM 调用走 context.llm_generate()，不经过主对话会话管理器，
-  **不影响 / 不污染主对话上下文**。
-- LLM 不可用或连续失败达到阈值时，直接报错并停用插件。
+定时轮询 HLTV.org 官方 RSS，将最新未推送的 CS2 电竞新闻推送到指定群聊。
+
+- 稳定 RSS：https://www.hltv.org/rss/news（简单 UA，规避 Cloudflare 挑战）
+- 去重：基于 RSS 的稳定唯一 id（hltvnewsXXXXX），持久化到 data 目录
+- 摘要：LLM 先概括后翻译，中文标题 + 简短中文概括，保留选手 ID / 队名 / 人名
+- 隔离：直接调用 LLM provider 的 text_chat，不经过会话管理器，不污染主对话上下文
+- 推送：头图 + 标题 + 发布时间 + 概括 + 原文链接（QQ 群友好排版，无 Markdown）
 """
 
 import asyncio
-import html
 import json
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
 
 import feedparser
 import httpx
-from astrbot.api.message import MessageChain
 
-import astrbot.api.event.filter as filter
 from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent
-from astrbot.api.message_components import Image, Plain
-from astrbot.api.star import Context, Star
+from astrbot.api.all import Context, Image, MessageChain, Plain
+from astrbot.api.star import Star
 
 RSS_URL = "https://www.hltv.org/rss/news"
-DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-MAX_RECORD = 300  # 去重记录最多保留的 ID 数（防膨胀）
-CST = timezone(timedelta(hours=8))  # 北京时间
+DEDUP_FILE = "hltv_news_pushed_ids.json"
+MAX_RECORD = 300  # 去重记录条数上限，防止文件无限膨胀
 
-SYSTEM_PROMPT_TMPL = """你是 HLTV（CS2 电竞新闻站）的中文播报助手。请把给定的英文新闻标题与简介，处理成一条面向中文读者的一句话播报。
+SYSTEM_PROMPT = """你是 HLTV（CS2 电竞新闻站）的中文播报助手，任务是把一条英文 HLTV 新闻转成中文播报信息。
 
-要求：
-1. 将标题翻译成通顺、地道的简体中文。
-2. 基于标题和简介，先理解新闻内容，再用一句中文（不超过 {max_chars} 个汉字）概括新闻核心。
-3. 【最重要】必须原样保留新闻中出现的选手 ID、昵称、真名、战队名、赛事名、平台名等英文专有名词，绝不强行翻译或音译成中文。例如 s1mple、ZywOo、m0NESY、MOUZ、FURIA、Natus Vincere、G2、Esports World Cup 等保持英文原名。
-4. 只输出一个 JSON 对象，不要任何解释文字，不要 markdown 代码块标记。格式如下：
-{{"title_zh": "翻译后的标题", "summary_zh": "中文概括"}}"""
+严格按以下要求执行：
+1. 把新闻标题翻译成自然流畅的中文标题。
+2. 用一句话中文概括新闻的核心内容。
+3. 必须保留原文中出现的选手 ID、选手真名、战队名、赛事名（如 s1mple、ZywOo、MOUZ、FURIA、Aurora、EWC、IEM 等），不要翻译或音译它们。
+4. 概括尽可能简短，控制在 {max_chars} 个汉字以内（可以少于，不要多于）。
+5. 只输出一个 JSON 对象，格式为：{{"title_zh": "翻译后的标题", "summary_zh": "中文概括"}}
+不要输出任何解释、前后缀或多余内容。"""
 
 
 class HltvNewsPlugin(Star):
-    """HLTV 新闻定时播报插件"""
+    """HLTV 新闻定时播报插件。"""
 
     def __init__(self, context: Context, config=None):
         super().__init__(context)
         self.config = config if isinstance(config, dict) else {}
 
-        # ---- 配置读取（带兜底，不假设字段必然存在）----
-        self.interval_min = self._clamp_int("poll_interval_minutes", 30, 5, 1440)
-        self.max_push = self._clamp_int("max_push_per_cycle", 3, 1, 10)
-        self.summary_chars = self._clamp_int("summary_max_chars", 50, 10, 200)
+        data_dir = Path(str(self.config.get("data_dir", "/opt/AstrBot/data")))
+        self.dedup_path = data_dir / DEDUP_FILE
+
+        self.interval_minutes = max(5, int(self.config.get("poll_interval_minutes", 30)))
+        self.max_push = max(1, min(10, int(self.config.get("max_push_per_cycle", 3))))
+        self.max_chars = int(self.config.get("summary_max_chars", 50))
         self.show_time = bool(self.config.get("show_publish_time", True))
-        self.enable_img = bool(self.config.get("enable_header_image", True))
-        self.ua = str(self.config.get("user_agent", DEFAULT_UA))
-        self.timeout = self._clamp_int("fetch_timeout", 25, 5, 120)
-        self.fail_threshold = self._clamp_int("llm_fail_threshold", 3, 1, 20)
+        self.enable_image = bool(self.config.get("enable_header_image", True))
+        self.ua = str(
+            self.config.get("user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+        )
+        self.timeout = max(5, int(self.config.get("fetch_timeout", 25)))
+        self.fail_threshold = max(1, int(self.config.get("llm_fail_threshold", 3)))
         self.provider_id = str(self.config.get("llm_provider_id", "")).strip()
 
-        # 推送目标：支持纯群号 或 完整会话 ID
-        targets = self.config.get("target_sessions") or []
-        if isinstance(targets, str):
-            targets = [targets]
-        self.targets = [str(t).strip() for t in targets if str(t).strip()]
+        self.target_sessions = self._parse_targets(self.config.get("target_sessions", []))
 
-        # ---- 持久化（放 data 目录，避免插件更新被覆盖）----
-        data_dir = Path(str(self.config.get("data_dir", "/opt/AstrBot/data")))
-        data_dir.mkdir(parents=True, exist_ok=True)
-        self.state_path = data_dir / "hltv_news_state.json"
-        self._seen_ids: set[str] = set()
-        self._load_state()
-
-        # ---- 运行时状态 ----
-        self._task: asyncio.Task | None = None
+        self._task = None
         self._running = False
-        self._provider_id_resolved = ""
-        self._consecutive_llm_fail = 0
-        self._pushed_total = 0
+        self._provider = None
+        self._llm_fail_streak = 0
 
-    # ---------------- 生命周期 ----------------
-
+    # ------------------------------------------------------------------
+    # 生命周期
+    # ------------------------------------------------------------------
     async def initialize(self):
-        """AstrBot 加载插件后调用。检查 LLM 可用性并启动后台轮询。"""
-        prov = await self._get_provider()
-        if prov is None:
-            logger.error(
-                "[hltv_news] 未找到可用的 LLM 提供商，插件停用。"
-                "请在插件配置中设置 llm_provider_id，或确认默认对话模型可用。"
-            )
-            self._running = False
+        """AstrBot 加载插件后调用。校验 LLM 与目标配置，启动轮询任务。"""
+        # 1. 解析 LLM provider
+        try:
+            if self.provider_id:
+                prov = self.context.get_provider_by_id(self.provider_id)
+                if prov is None:
+                    raise RuntimeError(f"配置的 LLM 提供商不存在: {self.provider_id}")
+            else:
+                prov = await self.context.get_using_provider_async(None)
+            if prov is None:
+                raise RuntimeError("当前没有可用的对话模型提供商")
+            # 探测可用性
+            await prov.test()
+            self._provider = prov
+        except Exception as e:
+            logger.error(f"[hltv_news] LLM 不可用，插件停止运行: {e}")
             return
-        self._provider_id_resolved = prov.meta().id
-        if not self.targets:
-            logger.warning(
-                "[hltv_news] 未配置推送目标群（target_sessions），本轮播报将只记录日志、不推送。"
-            )
 
-        logger.info(
-            "[hltv_news] 已启动：轮询间隔 %s 分钟，LLM provider=%s，推送目标=%s，单轮上限 %s 条",
-            self.interval_min,
-            self._provider_id_resolved,
-            self.targets,
-            self.max_push,
-        )
+        # 2. 校验目标
+        if not self.target_sessions:
+            logger.error("[hltv_news] 未配置推送目标群，插件停止运行")
+            return
+
+        # 3. 启动轮询
         self._running = True
         self._task = asyncio.create_task(self._loop())
+        logger.info(
+            f"[hltv_news] 已启动：每 {self.interval_minutes} 分钟轮询一次，"
+            f"目标群 {len(self.target_sessions)} 个，provider={self._provider.meta().id}"
+        )
+        await self._poll_once()  # 启动即先跑一轮（首次会立即推送最新一条）
 
     async def terminate(self):
-        """AstrBot 卸载/停用插件时调用。"""
+        """插件卸载/停用时调用。"""
         self._running = False
         if self._task:
             self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
         logger.info("[hltv_news] 已停止")
 
-    # ---------------- 后台轮询循环 ----------------
+    # ------------------------------------------------------------------
+    # 配置解析
+    # ------------------------------------------------------------------
+    def _parse_targets(self, raw) -> list[str]:
+        """支持纯群号或完整会话 ID；缺省平台固定为 aiocqhttp 群会话。"""
+        targets = []
+        if isinstance(raw, str):
+            raw = [raw]
+        for item in raw or []:
+            item = str(item).strip()
+            if not item:
+                continue
+            if ":" in item:
+                targets.append(item)
+            else:
+                targets.append(f"aiocqhttp:GroupMessage:{item}")
+        return targets
 
+    # ------------------------------------------------------------------
+    # 定时循环
+    # ------------------------------------------------------------------
     async def _loop(self):
         while self._running:
             try:
+                await asyncio.sleep(self.interval_minutes * 60)
+                if not self._running:
+                    break
                 await self._poll_once()
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("[hltv_news] 轮询异常: %s", e, exc_info=True)
-            try:
-                await asyncio.sleep(self.interval_min * 60)
-            except asyncio.CancelledError:
-                break
+                logger.error(f"[hltv_news] 轮询异常: {e}", exc_info=True)
 
-    async def _poll_once(self) -> int:
-        """执行一次轮询，返回本轮实际推送条数。"""
-        xml_text = await self._fetch_rss()
-        items = self._parse_rss(xml_text)
-        if not items:
-            logger.info("[hltv_news] RSS 无可用条目")
-            return 0
+    # ------------------------------------------------------------------
+    # 核心轮询
+    # ------------------------------------------------------------------
+    async def _poll_once(self):
+        xml = await self._fetch_rss()
+        feed = feedparser.parse(xml)
+        entries = feed.entries
+        if not entries:
+            logger.debug("[hltv_news] RSS 无条目")
+            return
 
-        # 按发布时间倒序（最新的在前）
-        items.sort(
-            key=lambda x: x["pub_dt"] or datetime.min.replace(tzinfo=timezone.utc),
-            reverse=True,
-        )
+        pushed = self._load_pushed()
+        fresh = [e for e in entries if str(e.get("id", "")).strip() not in pushed]
+        if not fresh:
+            logger.debug("[hltv_news] 没有新新闻")
+            return
 
-        pending = [it for it in items if it["id"] not in self._seen_ids]
-        if not pending:
-            logger.debug("[hltv_news] 暂无未推送的新新闻")
-            return 0
+        # 按发布时间倒序（最新在前），只取本轮需要推送的数量
+        fresh.sort(key=lambda e: e.get("published_parsed") or 0, reverse=True)
+        selected = fresh[: self.max_push]
+        logger.info(f"[hltv_news] 本轮待推送 {len(selected)} 条: "
+                    + ", ".join(str(e.get("id")) for e in selected))
 
-        logger.info(
-            "[hltv_news] 发现 %s 条未推送新闻，本轮最多推送 %s 条",
-            len(pending),
-            self.max_push,
-        )
-        pushed = 0
-        for it in pending[: self.max_push]:
-            if not self._running:
-                break
-            # 1) LLM 概括/翻译（失败不计入已推送，下轮可重试）
-            try:
-                title_zh, summary_zh = await self._summarize(it["title"], it["summary"])
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                self._consecutive_llm_fail += 1
-                logger.error("[hltv_news] 新闻 %s 的 LLM 概括失败: %s", it["id"], e)
-                if self._consecutive_llm_fail >= self.fail_threshold:
-                    logger.error(
-                        "[hltv_news] LLM 连续失败 %s 次，插件停用。",
-                        self.fail_threshold,
-                    )
-                    self._running = False
-                continue
-            self._consecutive_llm_fail = 0
+        for e in selected:
+            await self._process_item(e, pushed)
+            if not self._running:  # LLM 连续失败触发停用
+                return
 
-            # 2) 推送（推送失败不记 ID，下轮自动重试）
-            try:
-                await self._push(it, title_zh, summary_zh)
-                self._seen_ids.add(it["id"])
-                self._pushed_total += 1
-                self._save_state()
-                pushed += 1
-                logger.info("[hltv_news] 已推送: %s | %s", it["id"], title_zh)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
+    async def _process_item(self, entry, pushed: set):
+        item_id = str(entry.get("id", "")).strip()
+        result = await self._llm_summarize(entry)
+        if result is None:
+            self._llm_fail_streak += 1
+            if self._llm_fail_streak >= self.fail_threshold:
                 logger.error(
-                    "[hltv_news] 推送新闻 %s 失败: %s", it["id"], e, exc_info=True
+                    f"[hltv_news] LLM 连续失败 {self._llm_fail_streak} 次，插件自动停用"
                 )
+                self._running = False
+                return
+            logger.warning(
+                f"[hltv_news] 概括失败（连续 {self._llm_fail_streak} 次），本条跳过待下轮重试"
+            )
+            return
 
-        return pushed
+        self._llm_fail_streak = 0
+        chain = self._build_chain(entry, result["title_zh"], result["summary_zh"])
 
-    # ---------------- RSS 抓取与解析 ----------------
+        ok = True
+        for session in self.target_sessions:
+            try:
+                sent = await self.context.send_message(session, chain)
+                if not sent:
+                    logger.warning(f"[hltv_news] 推送失败（找不到平台/会话）: {session}")
+                    ok = False
+            except Exception as e:
+                logger.error(f"[hltv_news] 推送到 {session} 异常: {e}")
+                ok = False
 
+        if ok:
+            pushed.add(item_id)
+            self._save_pushed(pushed)
+            logger.info(f"[hltv_news] 已推送并记录: {item_id}")
+
+    # ------------------------------------------------------------------
+    # RSS 抓取 / 解析
+    # ------------------------------------------------------------------
     async def _fetch_rss(self) -> str:
-        """抓取 HLTV RSS，检测 Cloudflare 挑战页。"""
-        headers = {
-            "User-Agent": self.ua,
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-        }
+        headers = {"User-Agent": self.ua, "Accept-Language": "en-US,en;q=0.9"}
         async with httpx.AsyncClient(
-            follow_redirects=True, timeout=self.timeout, headers=headers
+            follow_redirects=True, timeout=self.timeout, headers=headers, http2=False
         ) as client:
             r = await client.get(RSS_URL)
-        if r.status_code != 200:
-            raise RuntimeError(f"RSS 请求失败，HTTP {r.status_code}")
-        head = r.text[:1000].lower()
-        if "just a moment" in head or "<rss" not in head:
-            raise RuntimeError(
-                "RSS 返回了 Cloudflare 挑战页或非 RSS 内容，请检查 User-Agent 配置"
-            )
-        return r.text
-
-    def _parse_rss(self, xml_text: str) -> list[dict[str, Any]]:
-        """解析 RSS 为条目列表。"""
-        d = feedparser.parse(xml_text)
-        items = []
-        for e in d.entries:
-            item_id = (e.get("id") or e.get("link") or "").strip()
-            if not item_id:
-                continue
-            media = e.get("media_content") or []
-            img = media[0].get("url") if media else None
-            pub_dt = None
-            if e.get("published_parsed"):
-                pub_dt = datetime(*e["published_parsed"][:6], tzinfo=timezone.utc)
-            items.append(
-                {
-                    "id": item_id,
-                    "title": html.unescape(e.get("title", "") or "").strip(),
-                    "link": e.get("link", ""),
-                    "summary": html.unescape(e.get("summary", "") or "").strip(),
-                    "image": img,
-                    "pub_dt": pub_dt,
-                }
-            )
-        return items
-
-    # ---------------- LLM 概括/翻译 ----------------
-
-    async def _get_provider(self):
-        """获取要使用的对话 provider。配置了 llm_provider_id 则用之，否则用默认对话模型。"""
-        if self.provider_id:
-            prov = self.context.get_provider_by_id(self.provider_id)
-            if prov is None:
-                logger.error(
-                    "[hltv_news] 配置的 LLM 提供商 %s 不存在", self.provider_id
+            if r.status_code != 200 or "<channel>" not in r.text[:600]:
+                raise RuntimeError(
+                    f"RSS 抓取异常 status={r.status_code}（可能被 Cloudflare 挑战拦截）"
                 )
-            return prov
-        return await self.context.get_using_provider_async()
+            return r.text
 
-    async def _summarize(self, title: str, summary: str) -> tuple[str, str]:
-        """调用 LLM：先概括后翻译，返回 (中文标题, 中文概括)。
+    @staticmethod
+    def _get_cover(entry) -> str | None:
+        mc = entry.get("media_content")
+        if isinstance(mc, list) and mc and mc[0].get("url"):
+            return mc[0]["url"]
+        return None
 
-        通过 context.llm_generate() 直接调用 provider，不经过会话管理器，
-        不会写入主对话历史，因此不影响主对话上下文。
-        """
-        system_prompt = SYSTEM_PROMPT_TMPL.format(max_chars=self.summary_chars)
-        user_prompt = (
-            f"新闻标题（英文）：{title}\n"
-            f"新闻简介（英文）：{summary}\n"
-            "请按系统要求输出 JSON。"
-        )
-        resp = await self.context.llm_generate(
-            chat_provider_id=self._provider_id_resolved,
-            prompt=user_prompt,
-            system_prompt=system_prompt,
-        )
-        text = (resp.completion_text or "").strip()
-        data = self._parse_llm_json(text)
-        if not data or not data.get("title_zh") or not data.get("summary_zh"):
-            raise ValueError(f"LLM 输出无法解析为预期 JSON: {text[:300]}")
-        return data["title_zh"].strip(), data["summary_zh"].strip()
+    @staticmethod
+    def _fmt_time(entry) -> str:
+        t = entry.get("published_parsed")
+        if not t:
+            return ""
+        dt = datetime(*t[:6], tzinfo=timezone.utc) + timedelta(hours=8)  # 北京时间
+        return dt.strftime("%Y-%m-%d %H:%M")
+
+    # ------------------------------------------------------------------
+    # LLM 概括翻译（直接调 provider，不经会话管理器，不污染主对话）
+    # ------------------------------------------------------------------
+    async def _llm_summarize(self, entry) -> dict | None:
+        title = str(entry.get("title", "")).strip()
+        summary = str(entry.get("summary", "")).strip()
+        prompt = f"HLTV 新闻标题：{title}\n\n新闻简介：{summary}\n\n请按规则输出中文播报 JSON。"
+        try:
+            resp = await self._provider.text_chat(
+                prompt=prompt,
+                system_prompt=SYSTEM_PROMPT.format(max_chars=self.max_chars),
+            )
+            text = resp.completion_text if resp else ""
+            parsed = self._parse_llm_json(text)
+            if parsed:
+                logger.info(
+                    f"[hltv_news] 概括完成: {parsed['title_zh']} | {parsed['summary_zh']}"
+                )
+            return parsed
+        except Exception as e:
+            logger.warning(f"[hltv_news] LLM 调用异常: {e}")
+            return None
 
     @staticmethod
     def _parse_llm_json(text: str) -> dict | None:
-        """容错解析 LLM 返回的 JSON（去除 markdown 代码块标记等）。"""
         if not text:
             return None
-        cleaned = re.sub(r"```(?:json)?", "", text).strip()
-        m = re.search(r"\{.*\}", cleaned, re.S)
-        if not m:
-            return None
+        text = text.strip()
+        # 去掉可能的 ```json ... ``` 围栏
+        m = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.S)
+        if m:
+            text = m.group(1).strip()
+        obj = None
         try:
-            return json.loads(m.group(0))
-        except Exception:
-            return None
+            obj = json.loads(text)
+        except json.JSONDecodeError:
+            m2 = re.search(r"\{.*\}", text, re.S)
+            if m2:
+                try:
+                    obj = json.loads(m2.group(0))
+                except json.JSONDecodeError:
+                    obj = None
+        if isinstance(obj, dict) and obj.get("title_zh") and obj.get("summary_zh"):
+            return {"title_zh": str(obj["title_zh"]).strip(),
+                    "summary_zh": str(obj["summary_zh"]).strip()}
+        return None
 
-    # ---------------- 推送 ----------------
-
-    async def _push(self, item: dict, title_zh: str, summary_zh: str) -> None:
-        """组装消息链并推送到所有目标群。"""
+    # ------------------------------------------------------------------
+    # 消息构建 / 发送
+    # ------------------------------------------------------------------
+    def _build_chain(self, entry, title_zh: str, summary_zh: str) -> MessageChain:
         comps = []
-        if self.enable_img and item.get("image"):
-            comps.append(Image(file=item["image"]))
+        cover = self._get_cover(entry)
+        if self.enable_image and cover:
+            comps.append(Image(file=cover))
 
-        lines = ["【HLTV 新闻播报】📰", f"🏷 {title_zh}"]
-        if self.show_time and item.get("pub_dt"):
-            local = item["pub_dt"].astimezone(CST)
-            lines.append(f"🕒 {local.strftime('%Y-%m-%d %H:%M')}（北京时间）")
+        lines = ["🏆【HLTV 播报】", f"📰 {title_zh}"]
+        if self.show_time:
+            lines.append(f"🕒 {self._fmt_time(entry)}（北京时间）")
         lines.append(f"📝 {summary_zh}")
-        lines.append(f"🔗 {item['link']}")
+        lines.append(f"🔗 {str(entry.get('link', ''))}")
         comps.append(Plain(text="\n".join(lines)))
+        return MessageChain(chain=comps)
 
-        chain = MessageChain(chain=comps)
-        for target in self.targets:
-            session = self._normalize_session(target)
-            ok = await self.context.send_message(session, chain)
-            if not ok:
-                logger.warning("[hltv_news] 无法匹配平台，消息未发送到 %s", target)
-
-    @staticmethod
-    def _normalize_session(target: str) -> str:
-        """纯数字群号 → 补全为 aiocqhttp 群会话 ID；其余按原样（完整会话 ID）。"""
-        target = target.strip()
-        if target.isdigit():
-            return f"aiocqhttp:GroupMessage:{target}"
-        return target
-
-    # ---------------- 持久化 ----------------
-
-    def _load_state(self):
+    # ------------------------------------------------------------------
+    # 去重持久化
+    # ------------------------------------------------------------------
+    def _load_pushed(self) -> set:
         try:
-            if self.state_path.exists():
-                data = json.loads(self.state_path.read_text(encoding="utf-8"))
-                self._seen_ids = set(data.get("seen_ids", []))
-                self._pushed_total = int(data.get("pushed_total", 0))
+            if self.dedup_path.exists():
+                data = json.loads(self.dedup_path.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    return set(str(x) for x in data)
         except Exception as e:
-            logger.warning("[hltv_news] 读取去重记录失败: %s", e)
+            logger.warning(f"[hltv_news] 读取去重记录失败: {e}")
+        return set()
 
-    def _save_state(self):
+    def _save_pushed(self, pushed: set):
         try:
-            ids = list(self._seen_ids)[-MAX_RECORD:]
-            payload = {"seen_ids": ids, "pushed_total": self._pushed_total}
-            self.state_path.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            limited = set(list(pushed)[-MAX_RECORD:])
+            self.dedup_path.write_text(
+                json.dumps(sorted(limited), ensure_ascii=False), encoding="utf-8"
             )
         except Exception as e:
-            logger.error("[hltv_news] 保存去重记录失败: %s", e)
-
-    # ---------------- 辅助 ----------------
-
-    def _clamp_int(self, key: str, default: int, lo: int, hi: int) -> int:
-        try:
-            v = int(self.config.get(key, default))
-        except (TypeError, ValueError):
-            return default
-        return max(lo, min(hi, v))
-
-    # ---------------- 手动指令（便于调试/手动触发） ----------------
-
-    @filter.command("hltv")
-    async def hltv(self, event: AstrMessageEvent):
-        """HLTV 新闻播报管理：/hltv push 立即轮询推送；/hltv status 查看状态。"""
-        args = (event.message_str or "").strip().split()
-        action = args[1].lower() if len(args) > 1 else "status"
-        if action == "push":
-            if not self._running:
-                yield event.plain_result(
-                    "插件当前未运行（可能 LLM 不可用已停用），请先检查日志。"
-                )
-                return
-            try:
-                n = await self._poll_once()
-                yield event.plain_result(f"轮询完成，本轮推送 {n} 条。")
-            except Exception as e:
-                yield event.plain_result(f"轮询出错：{e}")
-            return
-        if action == "status":
-            state = "运行中" if self._running else "已停用"
-            lines = [
-                f"状态：{state}",
-                f"轮询间隔：{self.interval_min} 分钟",
-                f"LLM 提供商：{self._provider_id_resolved or '(未解析)'}",
-                f"推送目标：{self.targets or '(未配置)'}",
-                f"已推送累计：{self._pushed_total} 条",
-                f"去重记录：{len(self._seen_ids)} 条",
-            ]
-            yield event.plain_result("\n".join(lines))
-            return
-        yield event.plain_result("用法：/hltv push 立即轮询推送；/hltv status 查看状态")
+            logger.error(f"[hltv_news] 保存去重记录失败: {e}")
