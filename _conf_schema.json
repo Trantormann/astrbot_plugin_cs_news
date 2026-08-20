@@ -1,0 +1,75 @@
+{
+  "poll_interval_minutes": {
+    "description": "轮询间隔（分钟）",
+    "type": "int",
+    "hint": "每隔多少分钟抓取一次 HLTV RSS。最小 5 分钟。",
+    "default": 30,
+    "min": 5
+  },
+  "target_sessions": {
+    "description": "推送目标群（群号或完整会话 ID，可多个）",
+    "type": "list",
+    "hint": "每个元素填一个目标：可直接填 QQ 群号（如 123456），或完整会话 ID（如 aiocqhttp:GroupMessage:123456）。填写多个则同时推送。",
+    "default": []
+  },
+  "llm_provider_id": {
+    "description": "用于概括/翻译的 LLM 提供商",
+    "type": "string",
+    "hint": "留空自动使用当前默认对话模型。选一个可用的对话提供商。",
+    "_special": "select_provider",
+    "default": ""
+  },
+  "max_push_per_cycle": {
+    "description": "每轮最多推送条数",
+    "type": "int",
+    "hint": "当一次轮询发现多条未推送新闻时，单轮最多推送的数量。",
+    "default": 3,
+    "min": 1,
+    "max": 10
+  },
+  "summary_max_chars": {
+    "description": "中文概括字数上限",
+    "type": "int",
+    "hint": "要求 LLM 将概括控制在多少个汉字以内（尽可能遵守，不绝对强制）。",
+    "default": 50,
+    "min": 10,
+    "max": 200
+  },
+  "show_publish_time": {
+    "description": "推送时显示发布时间",
+    "type": "bool",
+    "hint": "关闭则不显示发布时间行。",
+    "default": true
+  },
+  "enable_header_image": {
+    "description": "推送新闻头图",
+    "type": "bool",
+    "hint": "关闭则只发文字不带头图。",
+    "default": true
+  },
+  "user_agent": {
+    "description": "抓取 RSS 使用的 User-Agent",
+    "type": "string",
+    "hint": "HLTV 对部分 UA 会返回 Cloudflare 挑战页，保持默认即可；异常时再调整。",
+    "default": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+  },
+  "fetch_timeout": {
+    "description": "RSS 请求超时（秒）",
+    "type": "int",
+    "default": 25,
+    "min": 5
+  },
+  "llm_fail_threshold": {
+    "description": "LLM 连续失败停用阈值",
+    "type": "int",
+    "hint": "LLM 连续失败达到该次数后插件自动停用并报错（防止新闻无限堆积）。",
+    "default": 3,
+    "min": 1
+  },
+  "data_dir": {
+    "description": "数据持久化目录",
+    "type": "string",
+    "hint": "去重记录等持久化数据存放目录（请使用 AstrBot data 目录，避免被插件更新覆盖）。",
+    "default": "/opt/AstrBot/data"
+  }
+}
