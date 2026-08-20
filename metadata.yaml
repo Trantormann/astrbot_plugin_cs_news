@@ -1,4 +1,4 @@
-name: astrbot_plugin_hltv_news
+name: astrbot_plugin_cs_news
 display_name: CS 赛事新闻助手
 desc: |
   定时轮询 5eplay（5EPLAY）中文站的 CS2 电竞新闻与赛事数据，推送到指定群聊。
@@ -12,7 +12,7 @@ desc: |
 short_desc: CS2 电竞新闻与今日赛事定时播报（5eplay 数据源）。
 author: Trantormann
 version: 2.0.0
-repo: https://github.com/Trantormann/astrbot_plugin_hltv_news
+repo: https://github.com/Trantormann/astrbot_plugin_cs_news
 tags:
   - CS2
   - 5eplay

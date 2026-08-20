@@ -1,5 +1,5 @@
 """
-astrbot_plugin_hltv_news —— CS 赛事新闻助手
+astrbot_plugin_cs_news —— CS 赛事新闻助手
 ============================================
 CS2（CSGO）电竞新闻与赛事定时播报插件。
 
