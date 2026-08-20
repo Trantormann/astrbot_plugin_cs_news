@@ -26,7 +26,7 @@ from typing import Any
 
 import feedparser
 import httpx
-from astrbot.api.message import MessageChain
+from astrbot.api.all import MessageChain
 
 import astrbot.api.event.filter as filter
 from astrbot.api import logger
