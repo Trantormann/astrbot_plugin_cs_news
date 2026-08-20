@@ -1,16 +1,19 @@
 """
-astrbot_plugin_hltv_news
-========================
-HLTV（CS2 电竞）新闻定时播报插件。
+astrbot_plugin_hltv_news —— CS 赛事新闻助手
+============================================
+CS2（CSGO）电竞新闻与赛事定时播报插件。
 
 核心能力：
-- 每隔可配置的时间轮询 HLTV 官方 RSS（hltv.org/rss/news），抓取最新新闻。
-- 基于 RSS 稳定条目 ID 去重，只推送"先前未抓取过"的新闻；
+- 每隔可配置的时间轮询 5eplay 中文站（csgo.5eplay.com）新闻 API，
+  抓取最新中文新闻。
+- 基于稳定文章链接（jump_link）去重，只推送"先前未抓取过"的新闻；
   单轮最多推送 max_push_per_cycle 条（默认 3 条）。
-- 用 LLM 先概括后翻译：中文标题 + ≤50 汉字中文概括，
-  并严格保留选手 ID / 真名 / 战队名 / 赛事名等专有名词不翻译。
-- 推送内容：头图 + 中文标题 + 发布时间（北京时间）+ 中文概括 + 原文链接，
-  QQ 群友好排版（emoji 点缀、不用 Markdown）。
+- 用 LLM 基于中文标题生成 ≤50 汉字的一句话概括，
+  并严格保留选手 ID / 真名 / 战队名 / 赛事名等专有名词不改写。
+- 推送新闻时自动附上今日（北京时间）S/A 级赛事预告（数字等级默认 1、2，
+  可在配置中自行调整），赛事数据来自 5eplay 官方赛程 API。
+- 推送内容：头图 + 中文标题 + 发布时间（北京时间）+ 中文概括 + 原文链接
+  + 今日赛事列表，QQ 群友好排版（emoji 点缀、不用 Markdown）。
 - LLM 调用走 context.llm_generate()，不经过主对话会话管理器，
   **不影响 / 不污染主对话上下文**。
 - LLM 不可用或连续失败达到阈值时，直接报错并停用插件。
@@ -20,11 +23,10 @@ import asyncio
 import html
 import json
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import feedparser
 import httpx
 from astrbot.api.all import MessageChain
 
@@ -34,23 +36,23 @@ from astrbot.api.event import AstrMessageEvent
 from astrbot.api.message_components import Image, Plain
 from astrbot.api.star import Context, Star
 
-RSS_URL = "https://www.hltv.org/rss/news"
-DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-MAX_RECORD = 300  # 去重记录最多保留的 ID 数（防膨胀）
-CST = timezone(timedelta(hours=8))  # 北京时间
+from .fiveplay_api import CST, DEFAULT_UA, FivePlaySource
 
-SYSTEM_PROMPT_TMPL = """你是 HLTV（CS2 电竞新闻站）的中文播报助手。请把给定的英文新闻标题与简介，处理成一条面向中文读者的一句话播报。
+MAX_RECORD = 300  # 去重记录最多保留的 ID 数（防膨胀）
+
+SYSTEM_PROMPT_TMPL = """你是 CS2（CSGO）电竞新闻的中文播报助手。请把给定的一条中文新闻标题，处理成一条面向中文读者的一句话播报。
 
 要求：
-1. 将标题翻译成通顺、地道的简体中文。
-2. 基于标题和简介，先理解新闻内容，再用一句中文（不超过 {max_chars} 个汉字）概括新闻核心。
-3. 【最重要】必须原样保留新闻中出现的选手 ID、昵称、真名、战队名、赛事名、平台名等英文专有名词，绝不强行翻译或音译成中文。例如 s1mple、ZywOo、m0NESY、MOUZ、FURIA、Natus Vincere、G2、Esports World Cup 等保持英文原名。
-4. 只输出一个 JSON 对象，不要任何解释文字，不要 markdown 代码块标记。格式如下：
-{{"title_zh": "翻译后的标题", "summary_zh": "中文概括"}}"""
+1. 基于新闻标题理解新闻内容，用一句通顺、地道的简体中文（不超过 {max_chars} 个汉字）概括这条新闻的核心。
+2. 【最重要】必须原样保留标题中出现的选手 ID、昵称、真名、战队名、赛事名、平台名等专有名词，绝不强行改写或音译。例如 s1mple、ZywOo、m0NESY、MOUZ、FURIA、Natus Vincere、G2、FaZe、Vitality、电竞世俱杯 等保持原名。
+3. 只输出一个 JSON 对象，不要任何解释文字，不要 markdown 代码块标记。格式如下：
+{{"summary_zh": "中文概括"}}"""
+
+DEFAULT_GRADES = ["1", "2"]  # 默认只保留 S(1/2) 级赛事，可在配置中调整
 
 
-class HltvNewsPlugin(Star):
-    """HLTV 新闻定时播报插件"""
+class CsNewsPlugin(Star):
+    """CS 赛事新闻助手：5eplay 新闻 + 今日赛事播报插件"""
 
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -61,11 +63,19 @@ class HltvNewsPlugin(Star):
         self.max_push = self._clamp_int("max_push_per_cycle", 3, 1, 10)
         self.summary_chars = self._clamp_int("summary_max_chars", 50, 10, 200)
         self.show_time = bool(self.config.get("show_publish_time", True))
-        self.enable_img = bool(self.config.get("enable_header_image", False))
+        self.enable_img = bool(self.config.get("enable_header_image", True))
+        self.enable_match = bool(self.config.get("enable_match_push", True))
         self.ua = str(self.config.get("user_agent", DEFAULT_UA))
         self.timeout = self._clamp_int("fetch_timeout", 25, 5, 120)
         self.fail_threshold = self._clamp_int("llm_fail_threshold", 3, 1, 20)
         self.provider_id = str(self.config.get("llm_provider_id", "")).strip()
+
+        # 赛事等级筛选（数字，如 ["1","2"]=S/A 级），默认 1、2，可配置
+        grades = self.config.get("match_grades", DEFAULT_GRADES)
+        if isinstance(grades, str):
+            grades = [g.strip() for g in re.split(r"[,\s，]+", grades) if g.strip()]
+        grades = [str(g) for g in grades if str(g).isdigit()] or DEFAULT_GRADES
+        self.match_grades = grades
 
         # 推送目标：支持纯群号 或 完整会话 ID
         targets = self.config.get("target_sessions") or []
@@ -76,9 +86,12 @@ class HltvNewsPlugin(Star):
         # ---- 持久化（放 data 目录，避免插件更新被覆盖）----
         data_dir = Path(str(self.config.get("data_dir", "/opt/AstrBot/data")))
         data_dir.mkdir(parents=True, exist_ok=True)
-        self.state_path = data_dir / "hltv_news_state.json"
+        self.state_path = data_dir / "cs_news_state.json"
         self._seen_ids: set[str] = set()
         self._load_state()
+
+        # ---- 数据源 ----
+        self.source = FivePlaySource(ua=self.ua, timeout=self.timeout)
 
         # ---- 运行时状态 ----
         self._task: asyncio.Task | None = None
@@ -97,7 +110,7 @@ class HltvNewsPlugin(Star):
         prov = await self._get_provider()
         if prov is None:
             logger.error(
-                "[hltv_news] 未找到可用的 LLM 提供商，插件停用。"
+                "[cs_news] 未找到可用的 LLM 提供商，插件停用。"
                 "请在插件配置中设置 llm_provider_id，或确认默认对话模型可用。"
             )
             self._running = False
@@ -106,19 +119,22 @@ class HltvNewsPlugin(Star):
         self._platform_id = self._detect_platform_id()
         if not self._platform_id:
             logger.warning(
-                "[hltv_news] 未检测到可用平台实例 ID，纯群号将回退为 aiocqhttp"
+                "[cs_news] 未检测到可用平台实例 ID，纯群号将回退为 aiocqhttp"
             )
         if not self.targets:
             logger.warning(
-                "[hltv_news] 未配置推送目标群（target_sessions），本轮播报将只记录日志、不推送。"
+                "[cs_news] 未配置推送目标群（target_sessions），本轮播报将只记录日志、不推送。"
             )
 
         logger.info(
-            "[hltv_news] 已启动：轮询间隔 %s 分钟，LLM provider=%s，推送目标=%s，单轮上限 %s 条",
+            "[cs_news] 已启动：轮询间隔 %s 分钟，LLM provider=%s，推送目标=%s，"
+            "单轮上限 %s 条，赛事等级=%s，附今日赛事=%s",
             self.interval_min,
             self._provider_id_resolved,
             self.targets,
             self.max_push,
+            ",".join(self.match_grades),
+            self.enable_match,
         )
         self._running = True
         self._task = asyncio.create_task(self._loop())
@@ -128,7 +144,7 @@ class HltvNewsPlugin(Star):
         self._running = False
         if self._task:
             self._task.cancel()
-        logger.info("[hltv_news] 已停止")
+        logger.info("[cs_news] 已停止")
 
     # ---------------- 后台轮询循环 ----------------
 
@@ -139,7 +155,7 @@ class HltvNewsPlugin(Star):
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("[hltv_news] 轮询异常: %s", e, exc_info=True)
+                logger.error("[cs_news] 轮询异常: %s", e, exc_info=True)
             try:
                 await asyncio.sleep(self.interval_min * 60)
             except asyncio.CancelledError:
@@ -147,10 +163,9 @@ class HltvNewsPlugin(Star):
 
     async def _poll_once(self) -> int:
         """执行一次轮询，返回本轮实际推送条数。"""
-        xml_text = await self._fetch_rss()
-        items = self._parse_rss(xml_text)
+        items = await self.source.fetch_news()
         if not items:
-            logger.info("[hltv_news] RSS 无可用条目")
+            logger.info("[cs_news] 新闻接口无可用条目")
             return 0
 
         # 按发布时间倒序（最新的在前）
@@ -161,11 +176,11 @@ class HltvNewsPlugin(Star):
 
         pending = [it for it in items if it["id"] not in self._seen_ids]
         if not pending:
-            logger.debug("[hltv_news] 暂无未推送的新新闻")
+            logger.debug("[cs_news] 暂无未推送的新新闻")
             return 0
 
         logger.info(
-            "[hltv_news] 发现 %s 条未推送新闻，本轮最多推送 %s 条",
+            "[cs_news] 发现 %s 条未推送新闻，本轮最多推送 %s 条",
             len(pending),
             self.max_push,
         )
@@ -173,18 +188,17 @@ class HltvNewsPlugin(Star):
         for it in pending[: self.max_push]:
             if not self._running:
                 break
-            # 1) LLM 概括/翻译（失败不计入已推送，下轮可重试）
+            # 1) LLM 概括（失败不计入已推送，下轮可重试）
             try:
-                title_zh, summary_zh = await self._summarize(it["title"], it["summary"])
+                summary_zh = await self._summarize(it["title"])
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 self._consecutive_llm_fail += 1
-                logger.error("[hltv_news] 新闻 %s 的 LLM 概括失败: %s", it["id"], e)
+                logger.error("[cs_news] 新闻 %s 的 LLM 概括失败: %s", it["id"], e)
                 if self._consecutive_llm_fail >= self.fail_threshold:
                     logger.error(
-                        "[hltv_news] LLM 连续失败 %s 次，插件停用。",
-                        self.fail_threshold,
+                        "[cs_news] LLM 连续失败 %s 次，插件停用。", self.fail_threshold
                     )
                     self._running = False
                 continue
@@ -192,10 +206,10 @@ class HltvNewsPlugin(Star):
 
             # 2) 推送（任一目标失败则不记 ID，下轮自动重试）
             try:
-                ok = await self._push(it, title_zh, summary_zh)
+                ok = await self._push(it, summary_zh)
                 if not ok:
                     logger.warning(
-                        "[hltv_news] 新闻 %s 推送未全部成功，本轮不计入已推送，下轮重试",
+                        "[cs_news] 新闻 %s 推送未全部成功，本轮不计入已推送，下轮重试",
                         it["id"],
                     )
                     continue
@@ -203,64 +217,17 @@ class HltvNewsPlugin(Star):
                 self._pushed_total += 1
                 self._save_state()
                 pushed += 1
-                logger.info("[hltv_news] 已推送: %s | %s", it["id"], title_zh)
+                logger.info("[cs_news] 已推送: %s | %s", it["id"], it["title"])
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 logger.error(
-                    "[hltv_news] 推送新闻 %s 失败: %s", it["id"], e, exc_info=True
+                    "[cs_news] 推送新闻 %s 失败: %s", it["id"], e, exc_info=True
                 )
 
         return pushed
 
-    # ---------------- RSS 抓取与解析 ----------------
-
-    async def _fetch_rss(self) -> str:
-        """抓取 HLTV RSS，检测 Cloudflare 挑战页。"""
-        headers = {
-            "User-Agent": self.ua,
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-        }
-        async with httpx.AsyncClient(
-            follow_redirects=True, timeout=self.timeout, headers=headers
-        ) as client:
-            r = await client.get(RSS_URL)
-        if r.status_code != 200:
-            raise RuntimeError(f"RSS 请求失败，HTTP {r.status_code}")
-        head = r.text[:1000].lower()
-        if "just a moment" in head or "<rss" not in head:
-            raise RuntimeError(
-                "RSS 返回了 Cloudflare 挑战页或非 RSS 内容，请检查 User-Agent 配置"
-            )
-        return r.text
-
-    def _parse_rss(self, xml_text: str) -> list[dict[str, Any]]:
-        """解析 RSS 为条目列表。"""
-        d = feedparser.parse(xml_text)
-        items = []
-        for e in d.entries:
-            item_id = (e.get("id") or e.get("link") or "").strip()
-            if not item_id:
-                continue
-            media = e.get("media_content") or []
-            img = media[0].get("url") if media else None
-            pub_dt = None
-            if e.get("published_parsed"):
-                pub_dt = datetime(*e["published_parsed"][:6], tzinfo=timezone.utc)
-            items.append(
-                {
-                    "id": item_id,
-                    "title": html.unescape(e.get("title", "") or "").strip(),
-                    "link": e.get("link", ""),
-                    "summary": html.unescape(e.get("summary", "") or "").strip(),
-                    "image": img,
-                    "pub_dt": pub_dt,
-                }
-            )
-        return items
-
-    # ---------------- LLM 概括/翻译 ----------------
+    # ---------------- LLM 概括 ----------------
 
     async def _get_provider(self):
         """获取要使用的对话 provider。配置了 llm_provider_id 则用之，否则用默认对话模型。"""
@@ -268,22 +235,20 @@ class HltvNewsPlugin(Star):
             prov = self.context.get_provider_by_id(self.provider_id)
             if prov is None:
                 logger.error(
-                    "[hltv_news] 配置的 LLM 提供商 %s 不存在", self.provider_id
+                    "[cs_news] 配置的 LLM 提供商 %s 不存在", self.provider_id
                 )
             return prov
         return await self.context.get_using_provider_async()
 
-    async def _summarize(self, title: str, summary: str) -> tuple[str, str]:
-        """调用 LLM：先概括后翻译，返回 (中文标题, 中文概括)。
+    async def _summarize(self, title: str) -> str:
+        """调用 LLM：基于中文标题生成一句话中文概括。
 
         通过 context.llm_generate() 直接调用 provider，不经过会话管理器，
         不会写入主对话历史，因此不影响主对话上下文。
         """
         system_prompt = SYSTEM_PROMPT_TMPL.format(max_chars=self.summary_chars)
         user_prompt = (
-            f"新闻标题（英文）：{title}\n"
-            f"新闻简介（英文）：{summary}\n"
-            "请按系统要求输出 JSON。"
+            f"新闻标题（中文）：{title}\n" "请按系统要求输出 JSON。"
         )
         resp = await self.context.llm_generate(
             chat_provider_id=self._provider_id_resolved,
@@ -292,9 +257,9 @@ class HltvNewsPlugin(Star):
         )
         text = (resp.completion_text or "").strip()
         data = self._parse_llm_json(text)
-        if not data or not data.get("title_zh") or not data.get("summary_zh"):
+        if not data or not data.get("summary_zh"):
             raise ValueError(f"LLM 输出无法解析为预期 JSON: {text[:300]}")
-        return data["title_zh"].strip(), data["summary_zh"].strip()
+        return str(data["summary_zh"]).strip()
 
     @staticmethod
     def _parse_llm_json(text: str) -> dict | None:
@@ -310,12 +275,28 @@ class HltvNewsPlugin(Star):
         except Exception:
             return None
 
+    # ---------------- 赛事信息 ----------------
+
+    async def _fetch_today_matches_text(self) -> list[str]:
+        """抓取今日 S/A 级赛事，格式化为文本行（已按时间排序）。"""
+        try:
+            matches = await self.source.fetch_today_matches(self.match_grades)
+        except Exception as e:
+            logger.warning("[cs_news] 拉取今日赛事失败，忽略赛事部分: %s", e)
+            return []
+        lines = []
+        for m in matches:
+            tt = m["tournament"] or "未知赛事"
+            grade = m["grade_label"] or ""
+            head = f"🕒 {m['time_str']}  {m['team1']} vs {m['team2']}"
+            tail = f"  [{tt} · {grade}]" if grade else f"  [{tt}]"
+            lines.append(head + tail)
+        return lines
+
     # ---------------- 推送 ----------------
 
     async def _image_reachable(self, url: str) -> bool:
-        """快速探测图片 URL 是否真实可下载。
-        HLTV 图片 CDN 受 Cloudflare 挑战保护，普通请求常返回 403；
-        探测失败时推送自动降级为纯文字，避免整条新闻发送失败。"""
+        """快速探测图片 URL 是否真实可下载；不可达时自动降级为纯文字。"""
         try:
             async with httpx.AsyncClient(
                 timeout=8,
@@ -330,7 +311,7 @@ class HltvNewsPlugin(Star):
         except Exception:
             return False
 
-    async def _push(self, item: dict, title_zh: str, summary_zh: str) -> bool:
+    async def _push(self, item: dict, summary_zh: str) -> bool:
         """组装消息链并推送到所有目标群。全部成功返回 True，任一目标失败返回 False。"""
         comps = []
         img_ok = False
@@ -340,15 +321,25 @@ class HltvNewsPlugin(Star):
                 comps.append(Image(file=item["image"]))
             else:
                 logger.warning(
-                    "[hltv_news] 头图不可达（HLTV CDN 可能有反爬拦截），自动降级为纯文字推送"
+                    "[cs_news] 头图不可达，自动降级为纯文字推送: %s",
+                    item.get("image"),
                 )
 
-        lines = ["【HLTV 新闻播报】📰", f"🏷 {title_zh}"]
+        lines = ["【CS 赛事新闻】📰", f"🏷 {item['title']}"]
         if self.show_time and item.get("pub_dt"):
-            local = item["pub_dt"].astimezone(CST)
-            lines.append(f"🕒 {local.strftime('%Y-%m-%d %H:%M')}（北京时间）")
+            lines.append(f"🕒 {item['pub_dt'].strftime('%Y-%m-%d %H:%M')}（北京时间）")
         lines.append(f"📝 {summary_zh}")
         lines.append(f"🔗 {item['link']}")
+
+        # 附今日赛事（仅配置的等级，默认 S/A 级）
+        if self.enable_match:
+            match_lines = await self._fetch_today_matches_text()
+            if match_lines:
+                grade_desc = self._grade_desc()
+                lines.append("")
+                lines.append(f"【今日赛事 · {grade_desc}】🏆")
+                lines.extend(match_lines)
+
         comps.append(Plain(text="\n".join(lines)))
 
         chain = MessageChain(chain=comps)
@@ -360,12 +351,12 @@ class HltvNewsPlugin(Star):
             except Exception as e:
                 ok = False
                 logger.error(
-                    "[hltv_news] 推送异常 session=%s: %s", session, e, exc_info=True
+                    "[cs_news] 推送异常 session=%s: %s", session, e, exc_info=True
                 )
             if not ok:
                 all_ok = False
                 logger.warning(
-                    "[hltv_news] 无法匹配平台，消息未发送：目标=%s session=%s "
+                    "[cs_news] 无法匹配平台，消息未发送：目标=%s session=%s "
                     "（检测到平台ID=%s，请确认 target_sessions 填纯群号即可，"
                     "或填完整格式 <平台ID>:GroupMessage:<群号>）",
                     target,
@@ -373,6 +364,28 @@ class HltvNewsPlugin(Star):
                     self._platform_id or "(未检测到)",
                 )
         return all_ok
+
+    def _grade_desc(self) -> str:
+        """把数字等级映射为可读标签（如 1,2 -> S/A级）。"""
+        labels = []
+        for g in self.match_grades:
+            if g == "1":
+                labels.append("S")
+            elif g == "2":
+                labels.append("S")
+            elif g == "3":
+                labels.append("A")
+            elif g == "4":
+                labels.append("B")
+            elif g == "5":
+                labels.append("C")
+            else:
+                labels.append(g)
+        uniq = []
+        for x in labels:
+            if x not in uniq:
+                uniq.append(x)
+        return "/".join(uniq) + "级"
 
     def _normalize_session(self, target: str) -> str:
         """纯数字群号 → 用实际平台 ID 补全为群会话；
@@ -413,12 +426,18 @@ class HltvNewsPlugin(Star):
 
     def _load_state(self):
         try:
-            if self.state_path.exists():
-                data = json.loads(self.state_path.read_text(encoding="utf-8"))
+            # 新状态文件不存在时，兼容迁移旧文件（hltv_news_state.json）
+            path = self.state_path
+            if not path.exists():
+                old = path.parent / "hltv_news_state.json"
+                if old.exists():
+                    path = old
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
                 self._seen_ids = set(data.get("seen_ids", []))
                 self._pushed_total = int(data.get("pushed_total", 0))
         except Exception as e:
-            logger.warning("[hltv_news] 读取去重记录失败: %s", e)
+            logger.warning("[cs_news] 读取去重记录失败: %s", e)
 
     def _save_state(self):
         try:
@@ -428,7 +447,7 @@ class HltvNewsPlugin(Star):
                 json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
             )
         except Exception as e:
-            logger.error("[hltv_news] 保存去重记录失败: %s", e)
+            logger.error("[cs_news] 保存去重记录失败: %s", e)
 
     # ---------------- 辅助 ----------------
 
@@ -441,9 +460,18 @@ class HltvNewsPlugin(Star):
 
     # ---------------- 手动指令（便于调试/手动触发） ----------------
 
+    @filter.command("csnews")
+    async def csnews(self, event: AstrMessageEvent):
+        """CS 赛事新闻助手管理：/csnews push 立即轮询推送；/csnews status 查看状态。"""
+        await self._handle_command(event, "csnews")
+
     @filter.command("hltv")
-    async def hltv(self, event: AstrMessageEvent):
-        """HLTV 新闻播报管理：/hltv push 立即轮询推送；/hltv status 查看状态。"""
+    async def hltv_alias(self, event: AstrMessageEvent):
+        """旧指令别名，功能同 /csnews。"""
+        await self._handle_command(event, "csnews")
+
+    async def _handle_command(self, event: AstrMessageEvent, cmd: str):
+        """事件学习 + push/status 分发。"""
         # 事件学习：从本条真实事件（unified_msg_origin 形如 "MyBot:GroupMessage:群号"）
         # 提取该群所在平台的实例 ID，优先于自动探测，保证纯群号补全准确。
         origin = getattr(event, "unified_msg_origin", "") or ""
@@ -451,7 +479,7 @@ class HltvNewsPlugin(Star):
             learned = origin.split(":", 1)[0]
             if learned and learned != self._platform_id:
                 self._platform_id = learned
-                logger.info("[hltv_news] 已从事件学习平台 ID: %s", learned)
+                logger.info("[cs_news] 已从事件学习平台 ID: %s", learned)
         args = (event.message_str or "").strip().split()
         action = args[1].lower() if len(args) > 1 else "status"
         if action == "push":
@@ -468,15 +496,20 @@ class HltvNewsPlugin(Star):
             return
         if action == "status":
             state = "运行中" if self._running else "已停用"
+            grade_desc = self._grade_desc()
             lines = [
                 f"状态：{state}",
                 f"轮询间隔：{self.interval_min} 分钟",
                 f"LLM 提供商：{self._provider_id_resolved or '(未解析)'}",
                 f"平台 ID：{self._platform_id or '(未检测到)'}",
                 f"推送目标：{self.targets or '(未配置)'}",
+                f"赛事等级筛选：{','.join(self.match_grades)}（{grade_desc}）",
+                f"附今日赛事：{'开' if self.enable_match else '关'}",
                 f"已推送累计：{self._pushed_total} 条",
                 f"去重记录：{len(self._seen_ids)} 条",
             ]
             yield event.plain_result("\n".join(lines))
             return
-        yield event.plain_result("用法：/hltv push 立即轮询推送；/hltv status 查看状态")
+        yield event.plain_result(
+            f"用法：/{cmd} push 立即轮询推送；/{cmd} status 查看状态"
+        )

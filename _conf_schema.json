@@ -2,7 +2,7 @@
   "poll_interval_minutes": {
     "description": "轮询间隔（分钟）",
     "type": "int",
-    "hint": "每隔多少分钟抓取一次 HLTV RSS。最小 5 分钟。",
+    "hint": "每隔多少分钟抓取一次 5eplay 新闻。最小 5 分钟。",
     "default": 30,
     "min": 5
   },
@@ -15,11 +15,11 @@
   "platform_id": {
     "description": "推送平台实例 ID（可空，通用环境推荐留空）",
     "type": "string",
-    "hint": "留空即可：在目标群执行一次 /hltv 会自动学习平台 ID；多平台机器可显式指定（如 MyBot）。格式见 /hltv status 输出的「平台 ID」。",
+    "hint": "留空即可：在目标群执行一次 /csnews 会自动学习平台 ID；多平台机器可显式指定（如 MyBot）。格式见 /csnews status 输出的「平台 ID」。",
     "default": ""
   },
   "llm_provider_id": {
-    "description": "用于概括/翻译的 LLM 提供商",
+    "description": "用于概括新闻的 LLM 提供商",
     "type": "string",
     "hint": "留空自动使用当前默认对话模型。选一个可用的对话提供商。",
     "_special": "select_provider",
@@ -50,17 +50,29 @@
   "enable_header_image": {
     "description": "推送新闻头图",
     "type": "bool",
-    "hint": "HLTV 图片 CDN 受 Cloudflare 反爬保护，通常无法下载；默认关闭头图。若开启且图片不可达，插件会自动降级为纯文字推送，不影响正文。",
-    "default": false
+    "hint": "5eplay 图床（oss.5eplay.com）可直接下载，默认开启头图；若某张图不可达，插件会自动降级为纯文字推送，不影响正文。",
+    "default": true
+  },
+  "match_grades": {
+    "description": "附推赛事等级（5eplay 数字分级）",
+    "type": "list",
+    "hint": "新闻推送时附带的今日赛事按此数字等级筛选。5eplay 分级：1/2=S级、3=A级、4=B级、5=C级。默认 [\"1\",\"2\"] 即只推 S 级。可自行改成 [\"1\",\"2\",\"3\"]（S+A级）等。",
+    "default": ["1", "2"]
+  },
+  "enable_match_push": {
+    "description": "新闻推送时附带今日赛事",
+    "type": "bool",
+    "hint": "关闭则只推新闻、不附赛事列表。今日（北京时间）无符合等级的比赛时自动省略赛事部分。",
+    "default": true
   },
   "user_agent": {
-    "description": "抓取 RSS 使用的 User-Agent",
+    "description": "抓取数据使用的 User-Agent",
     "type": "string",
-    "hint": "HLTV 对部分 UA 会返回 Cloudflare 挑战页，保持默认即可；异常时再调整。",
+    "hint": "5eplay 接口对普通 UA 友好，保持默认即可；异常时再调整。",
     "default": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
   },
   "fetch_timeout": {
-    "description": "RSS 请求超时（秒）",
+    "description": "数据请求超时（秒）",
     "type": "int",
     "default": 25,
     "min": 5

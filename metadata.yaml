@@ -1,21 +1,23 @@
 name: astrbot_plugin_hltv_news
-display_name: HLTV 新闻播报
+display_name: CS 赛事新闻助手
 desc: |
-  定时轮询 HLTV.org 官方 RSS，抓取最新新闻并推送到指定群聊。
+  定时轮询 5eplay（5EPLAY）中文站的 CS2 电竞新闻与赛事数据，推送到指定群聊。
 
-  - 每隔可配置的间隔轮询一次 HLTV RSS
-  - 抓取先前未推送过的最新新闻（按稳定 ID 去重，最多一次推 3 条）
-  - 用 LLM 先概括后翻译：中文标题 + ≤50 字中文概括，保留选手 ID / 队名 / 人名不翻译
-  - 推送格式：头图 + 标题 + 发布时间 + 概括 + 原文链接（QQ 群友好排版）
+  - 每隔可配置的间隔轮询一次 5eplay 新闻 API，抓取最新中文新闻
+  - 按稳定文章链接去重，抓取先前未推送过的最新新闻（最多一次推 3 条）
+  - 用 LLM 基于中文标题生成 ≤50 字中文概括，保留选手 ID / 队名 / 人名不改写
+  - 推送新闻时自动附上今日（北京时间）S/A 级赛事预告（数字等级默认 1、2，可配置）
+  - 推送格式：头图 + 标题 + 发布时间 + 概括 + 原文链接 + 今日赛事（QQ 群友好排版）
   - LLM 不可用时直接报错停用，绝不污染主对话上下文
-short_desc: HLTV（CS2 电竞）新闻定时播报。
+short_desc: CS2 电竞新闻与今日赛事定时播报（5eplay 数据源）。
 author: Trantormann
-version: 1.0.4
+version: 2.0.0
 repo: https://github.com/Trantormann/astrbot_plugin_hltv_news
 tags:
-  - HLTV
   - CS2
+  - 5eplay
   - 新闻
+  - 赛事
   - 播报
 support_platforms:
   - aiocqhttp
