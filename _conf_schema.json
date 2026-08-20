@@ -41,12 +41,6 @@
     "min": 10,
     "max": 200
   },
-  "show_publish_time": {
-    "description": "推送时显示发布时间",
-    "type": "bool",
-    "hint": "关闭则不显示发布时间行。",
-    "default": true
-  },
   "enable_header_image": {
     "description": "推送新闻头图",
     "type": "bool",
@@ -57,7 +51,10 @@
     "description": "附推赛事等级（5eplay 数字分级）",
     "type": "list",
     "hint": "新闻推送时附带的今日赛事按此数字等级筛选。5eplay 分级：1/2=S级、3=A级、4=B级、5=C级。默认 [\"1\",\"2\"] 即只推 S 级。可自行改成 [\"1\",\"2\",\"3\"]（S+A级）等。",
-    "default": ["1", "2"]
+    "default": [
+      "1",
+      "2"
+    ]
   },
   "enable_match_push": {
     "description": "新闻推送时附带今日赛事",

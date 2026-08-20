@@ -12,8 +12,8 @@ CS2（CSGO）电竞新闻与赛事定时播报插件。
   并严格保留选手 ID / 真名 / 战队名 / 赛事名等专有名词不改写。
 - 推送新闻时自动附上今日（北京时间）S/A 级赛事预告（数字等级默认 1、2，
   可在配置中自行调整），赛事数据来自 5eplay 官方赛程 API。
-- 推送内容：头图 + 中文标题 + 发布时间（北京时间）+ 中文概括 + 原文链接
-  + 今日赛事列表，QQ 群友好排版（emoji 点缀、不用 Markdown）。
+- 推送内容：头图 + 中文标题 + 中文概括 + 今日赛事列表，
+  QQ 群友好排版（emoji 点缀、不用 Markdown）。
 - LLM 调用走 context.llm_generate()，不经过主对话会话管理器，
   **不影响 / 不污染主对话上下文**。
 - LLM 不可用或连续失败达到阈值时，直接报错并停用插件。
@@ -64,7 +64,6 @@ class CsNewsPlugin(Star):
         self.interval_min = self._clamp_int("poll_interval_minutes", 30, 5, 1440)
         self.max_push = self._clamp_int("max_push_per_cycle", 3, 1, 10)
         self.summary_chars = self._clamp_int("summary_max_chars", 50, 10, 200)
-        self.show_time = bool(self.config.get("show_publish_time", True))
         self.enable_img = bool(self.config.get("enable_header_image", True))
         self.enable_match = bool(self.config.get("enable_match_push", True))
         self.ua = str(self.config.get("user_agent", DEFAULT_UA))
@@ -329,21 +328,13 @@ class CsNewsPlugin(Star):
 
     # ---------------- 赛事信息 ----------------
 
-    async def _fetch_today_matches_text(self) -> list[str]:
-        """抓取今日 S/A 级赛事，格式化为文本行（已按时间排序）。"""
+    async def _fetch_today_matches(self) -> list[dict]:
+        """抓取今日 S/A 级赛事（已按时间排序），返回结构化数据。"""
         try:
-            matches = await self.source.fetch_today_matches(self.match_grades)
+            return await self.source.fetch_today_matches(self.match_grades)
         except Exception as e:
             logger.warning("[cs_news] 拉取今日赛事失败，忽略赛事部分: %s", e)
             return []
-        lines = []
-        for m in matches:
-            tt = m["tournament"] or "未知赛事"
-            grade = m["grade_label"] or ""
-            head = f"🕒 {m['time_str']}  {m['team1']} vs {m['team2']}"
-            tail = f"  [{tt} · {grade}]" if grade else f"  [{tt}]"
-            lines.append(head + tail)
-        return lines
 
     # ---------------- 推送 ----------------
 
@@ -377,20 +368,23 @@ class CsNewsPlugin(Star):
                     item.get("image"),
                 )
 
-        lines = ["【CS 赛事新闻】📰", f"🏷 {item['title']}"]
-        if self.show_time and item.get("pub_dt"):
-            lines.append(f"🕒 {item['pub_dt'].strftime('%Y-%m-%d %H:%M')}（北京时间）")
-        lines.append(f"📝 {summary_zh}")
-        lines.append(f"🔗 {item['link']}")
+        lines = ["【CS 赛事新闻】📰", f"🏷 {item['title']}", f"📝 {summary_zh}"]
 
         # 附今日赛事（仅配置的等级，默认 S/A 级）
         if self.enable_match:
-            match_lines = await self._fetch_today_matches_text()
-            if match_lines:
+            matches = await self._fetch_today_matches()
+            if matches:
                 grade_desc = self._grade_desc()
                 lines.append("")
                 lines.append(f"【今日赛事 · {grade_desc}】🏆")
-                lines.extend(match_lines)
+                # 按赛事名分组：每组一个 [赛事名] 标题，其下每场对阵一行
+                groups: dict[str, list[dict]] = {}
+                for m in matches:
+                    groups.setdefault(m["tournament"] or "未知赛事", []).append(m)
+                for tt, ms in groups.items():
+                    lines.append(f"[{tt}]")
+                    for m in ms:
+                        lines.append(f"{m['team1']} vs {m['team2']} {m['time_str']}")
 
         comps.append(Plain(text="\n".join(lines)))
 
