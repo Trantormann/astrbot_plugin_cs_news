@@ -9,7 +9,7 @@ HLTV（CS2 电竞）新闻定时播报插件。定时轮询 [HLTV 官方 RSS](ht
 - 单轮最多推送 3 条（可配置），避免一次性刷屏
 - 用 LLM **先概括后翻译**：中文标题 + ≤50 汉字中文概括
   - 严格保留选手 ID / 昵称 / 真名 / 战队名 / 赛事名等英文专有名词，不强行翻译
-- 推送内容：**头图 + 中文标题 + 发布时间（北京时间）+ 中文概括 + 原文链接**，QQ 群友好排版（emoji 点缀、不用 Markdown）
+- 推送内容：**中文标题 + 发布时间（北京时间）+ 中文概括 + 原文链接**，QQ 群友好排版（emoji 点缀、不用 Markdown）；头图默认关闭（HLTV 图片 CDN 受 Cloudflare 反爬保护），开启后也会自动检测、不可达即降级为纯文字
 - LLM 调用走独立通道，**不影响 / 不污染主对话上下文**
 - LLM 不可用或连续失败达阈值时**直接报错停用**（默认连续 3 次失败停用）
 - 首次启用立即推送当前最新一条
@@ -33,7 +33,7 @@ HLTV（CS2 电竞）新闻定时播报插件。定时轮询 [HLTV 官方 RSS](ht
 | `max_push_per_cycle` | int | 3 | 单轮最多推送条数（1~10） |
 | `summary_max_chars` | int | 50 | 中文概括字数上限（尽可能遵守，不绝对强制） |
 | `show_publish_time` | bool | true | 是否显示发布时间 |
-| `enable_header_image` | bool | true | 是否推送新闻头图 |
+| `enable_header_image` | bool | `false` | 是否附带头图。HLTV 图片 CDN 受 Cloudflare 反爬保护，通常无法下载，默认关闭；开启后若图片不可达会自动降级为纯文字推送，不影响正文 | true | 是否推送新闻头图 |
 | `user_agent` | string | `Mozilla/5.0 ...` | 抓取 RSS 的 UA。HLTV 对部分 UA 返回 Cloudflare 挑战页，异常时调整 |
 | `fetch_timeout` | int | 25 | RSS 请求超时（秒） |
 | `llm_fail_threshold` | int | 3 | LLM 连续失败停用阈值 |
@@ -56,7 +56,7 @@ HLTV（CS2 电竞）新闻定时播报插件。定时轮询 [HLTV 官方 RSS](ht
 - 抓取：`httpx` 异步请求 `https://www.hltv.org/rss/news`
 - 解析：`feedparser`
 - 概括/翻译：`context.llm_generate()` 直接调用 LLM provider，不经过会话管理器，不写入主对话历史
-- 推送：`context.send_message()` 主动向目标群发送「头图 + 文本」消息链
+- 推送：`context.send_message()` 主动向目标群发送「文本（可选附带已可达头图）」消息链
 
 ## 开发
 

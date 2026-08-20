@@ -10,7 +10,7 @@ desc: |
   - LLM 不可用时直接报错停用，绝不污染主对话上下文
 short_desc: HLTV（CS2 电竞）新闻定时播报。
 author: Trantormann
-version: 1.0.3
+version: 1.0.4
 repo: https://github.com/Trantormann/astrbot_plugin_hltv_news
 tags:
   - HLTV

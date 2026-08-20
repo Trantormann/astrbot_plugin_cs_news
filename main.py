@@ -61,7 +61,7 @@ class HltvNewsPlugin(Star):
         self.max_push = self._clamp_int("max_push_per_cycle", 3, 1, 10)
         self.summary_chars = self._clamp_int("summary_max_chars", 50, 10, 200)
         self.show_time = bool(self.config.get("show_publish_time", True))
-        self.enable_img = bool(self.config.get("enable_header_image", True))
+        self.enable_img = bool(self.config.get("enable_header_image", False))
         self.ua = str(self.config.get("user_agent", DEFAULT_UA))
         self.timeout = self._clamp_int("fetch_timeout", 25, 5, 120)
         self.fail_threshold = self._clamp_int("llm_fail_threshold", 3, 1, 20)
@@ -312,11 +312,36 @@ class HltvNewsPlugin(Star):
 
     # ---------------- 推送 ----------------
 
+    async def _image_reachable(self, url: str) -> bool:
+        """快速探测图片 URL 是否真实可下载。
+        HLTV 图片 CDN 受 Cloudflare 挑战保护，普通请求常返回 403；
+        探测失败时推送自动降级为纯文字，避免整条新闻发送失败。"""
+        try:
+            async with httpx.AsyncClient(
+                timeout=8,
+                follow_redirects=True,
+                headers={"User-Agent": DEFAULT_UA},
+            ) as c:
+                r = await c.get(url)
+            ct = r.headers.get("content-type", "")
+            return r.status_code == 200 and (
+                ct.startswith("image/") or len(r.content) > 1000
+            )
+        except Exception:
+            return False
+
     async def _push(self, item: dict, title_zh: str, summary_zh: str) -> bool:
         """组装消息链并推送到所有目标群。全部成功返回 True，任一目标失败返回 False。"""
         comps = []
+        img_ok = False
         if self.enable_img and item.get("image"):
-            comps.append(Image(file=item["image"]))
+            img_ok = await self._image_reachable(item["image"])
+            if img_ok:
+                comps.append(Image(file=item["image"]))
+            else:
+                logger.warning(
+                    "[hltv_news] 头图不可达（HLTV CDN 可能有反爬拦截），自动降级为纯文字推送"
+                )
 
         lines = ["【HLTV 新闻播报】📰", f"🏷 {title_zh}"]
         if self.show_time and item.get("pub_dt"):

@@ -50,8 +50,8 @@
   "enable_header_image": {
     "description": "推送新闻头图",
     "type": "bool",
-    "hint": "关闭则只发文字不带头图。",
-    "default": true
+    "hint": "HLTV 图片 CDN 受 Cloudflare 反爬保护，通常无法下载；默认关闭头图。若开启且图片不可达，插件会自动降级为纯文字推送，不影响正文。",
+    "default": false
   },
   "user_agent": {
     "description": "抓取 RSS 使用的 User-Agent",
