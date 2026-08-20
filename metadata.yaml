@@ -11,7 +11,7 @@ desc: |
 short_desc: HLTV（CS2 电竞）新闻定时播报。
 author: Iris (Antor)
 version: 1.0.0
-repo: https://github.com/
+repo: https://github.com/Trantormann/astrbot_plugin_hltv_news
 tags:
   - HLTV
   - CS2

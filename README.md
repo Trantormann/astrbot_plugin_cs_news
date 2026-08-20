@@ -1,54 +1,68 @@
 # astrbot_plugin_hltv_news
 
-AstrBot 插件：定时轮询 **HLTV.org**（CS2 电竞）官方 RSS，把最新新闻自动推送到指定 QQ 群。
+HLTV（CS2 电竞）新闻定时播报插件。定时轮询 [HLTV 官方 RSS](https://www.hltv.org/rss/news)，抓取最新新闻，推送到指定 QQ 群。
 
-## 功能
+## 功能特性
 
-- 可配置轮询间隔（默认 30 分钟，最小 5 分钟），自动抓取 HLTV 官方 RSS
-- 基于 RSS 稳定唯一 ID 去重，只推送**先前未推送过**的新闻
-- 单轮最多推送 3 条（可配置），优先最新
-- 使用 LLM **先概括后翻译**：中文标题 + 简短中文概括（默认 ≤50 字）
-  - 保留选手 ID / 真名 / 队名 / 赛事名（如 `s1mple`、`MOUZ`、`EWC`），不强行翻译
-- LLM 调用直接走 provider，**不经过会话管理器、不污染主对话上下文**
-- 推送格式：头图 + 标题 + 发布时间（北京时间）+ 概括 + 原文链接，QQ 群友好排版（无 Markdown）
-- LLM 不可用时插件**直接报错停用**；运行中连续失败达阈值也会自动停用
+- 每隔可配置时间轮询 HLTV RSS（默认 30 分钟，最小 5 分钟）
+- 基于 RSS 稳定条目 ID 去重，只推送**先前未抓取过**的新闻
+- 单轮最多推送 3 条（可配置），避免一次性刷屏
+- 用 LLM **先概括后翻译**：中文标题 + ≤50 汉字中文概括
+  - 严格保留选手 ID / 昵称 / 真名 / 战队名 / 赛事名等英文专有名词，不强行翻译
+- 推送内容：**头图 + 中文标题 + 发布时间（北京时间）+ 中文概括 + 原文链接**，QQ 群友好排版（emoji 点缀、不用 Markdown）
+- LLM 调用走独立通道，**不影响 / 不污染主对话上下文**
+- LLM 不可用或连续失败达阈值时**直接报错停用**（默认连续 3 次失败停用）
+- 首次启用立即推送当前最新一条
 
 ## 安装
 
-1. 将本仓库克隆到 AstrBot 的 `data/plugins/` 目录：
-   ```bash
-   git clone <本仓库地址> /opt/AstrBot/data/plugins/astrbot_plugin_hltv_news
-   ```
-2. 安装依赖（AstrBot 通常自动安装，也可手动）：
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. 在 AstrBot WebUI「插件管理」中重载/启用插件。
+1. 将本仓库克隆/放置到 AstrBot 的 `data/plugins/` 目录（或在插件市场安装）。
+2. 在 AstrBot WebUI「插件管理」中启用本插件，并点击「配置」填写参数。
+3. 重载插件生效。
 
-## 配置（WebUI 插件设置）
+> 依赖 `feedparser`、`httpx`，见 `requirements.txt`。
 
-| 配置项 | 说明 | 默认 |
-|---|---|---|
-| `poll_interval_minutes` | 轮询间隔（分钟），最小 5 | 30 |
-| `target_sessions` | 推送目标群，每项填纯群号或完整会话 ID（`aiocqhttp:GroupMessage:群号`），可多个 | 空 |
-| `llm_provider_id` | 概括/翻译用的 LLM 提供商，留空用默认对话模型 | 空 |
-| `max_push_per_cycle` | 单轮最多推送条数 | 3 |
-| `summary_max_chars` | 中文概括字数上限（汉字） | 50 |
-| `show_publish_time` | 是否显示发布时间 | true |
-| `enable_header_image` | 是否推送新闻头图 | true |
-| `user_agent` | 抓取 RSS 的 UA（HLTV 反爬敏感） | 简单 UA |
-| `fetch_timeout` | RSS 请求超时（秒） | 25 |
-| `llm_fail_threshold` | LLM 连续失败停用阈值 | 3 |
-| `data_dir` | 去重记录持久化目录 | `/opt/AstrBot/data` |
+## 配置项
 
-> 首次启用会**立即推送当下最新一条**新闻；之后仅推送新发布的。
+| 配置项 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `poll_interval_minutes` | int | 30 | 轮询间隔（分钟），最小 5 |
+| `target_sessions` | list | `[]` | 推送目标群。每项可填**纯 QQ 群号**（如 `123456`，自动补全为 `aiocqhttp:GroupMessage:123456`）或**完整会话 ID**（如 `aiocqhttp:GroupMessage:123456`）。可填多个，同时推送 |
+| `llm_provider_id` | string | 空 | 用于概括/翻译的 LLM 提供商；留空自动使用默认对话模型 |
+| `max_push_per_cycle` | int | 3 | 单轮最多推送条数（1~10） |
+| `summary_max_chars` | int | 50 | 中文概括字数上限（尽可能遵守，不绝对强制） |
+| `show_publish_time` | bool | true | 是否显示发布时间 |
+| `enable_header_image` | bool | true | 是否推送新闻头图 |
+| `user_agent` | string | `Mozilla/5.0 ...` | 抓取 RSS 的 UA。HLTV 对部分 UA 返回 Cloudflare 挑战页，异常时调整 |
+| `fetch_timeout` | int | 25 | RSS 请求超时（秒） |
+| `llm_fail_threshold` | int | 3 | LLM 连续失败停用阈值 |
+| `data_dir` | string | `/opt/AstrBot/data` | 去重记录等持久化数据目录（勿放插件自身目录，避免更新被覆盖） |
 
-## 数据
+## 手动指令
 
-去重记录保存在 `{data_dir}/hltv_news_pushed_ids.json`，记录最近 300 条已推送新闻 ID（自动裁剪防膨胀）。
+| 指令 | 说明 |
+|---|---|
+| `/hltv push` | 立即执行一次轮询并推送（便于调试/手动触发） |
+| `/hltv status` | 查看插件运行状态、LLM 提供商、推送目标、累计推送数 |
 
-## 说明
+## 数据与去重
 
-- 仅支持 `aiocqhttp`（QQ）平台
-- 网络请求使用 `httpx`（异步），依赖 `feedparser` 解析 RSS
-- HLTV 对部分 User-Agent 返回 Cloudflare 挑战页，默认简单 UA 已验证可用；如遇异常可在配置中调整
+- 去重记录保存在 `data_dir/hltv_news_state.json`，最多保留 300 条 ID，防止文件膨胀。
+- 推送成功才记录 ID；LLM 概括失败/推送失败不记录，下轮自动重试。
+
+## 原理
+
+- 抓取：`httpx` 异步请求 `https://www.hltv.org/rss/news`
+- 解析：`feedparser`
+- 概括/翻译：`context.llm_generate()` 直接调用 LLM provider，不经过会话管理器，不写入主对话历史
+- 推送：`context.send_message()` 主动向目标群发送「头图 + 文本」消息链
+
+## 开发
+
+- 遵循 AstrBot 插件开发规范（`Star` 基类 + `metadata.yaml` + `_conf_schema.json`）。
+- 代码用 ruff 格式化。
+- 仓库采用标准插件目录结构，可直接推送到 GitHub 供插件市场分发。
+
+## License
+
+MIT
