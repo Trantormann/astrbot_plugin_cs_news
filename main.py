@@ -89,7 +89,10 @@ class CsNewsPlugin(Star):
         data_dir = Path(str(self.config.get("data_dir", "/opt/AstrBot/data")))
         data_dir.mkdir(parents=True, exist_ok=True)
         self.state_path = data_dir / "cs_news_state.json"
-        self._seen_ids: set[str] = set()
+        # 去重状态按目标群独立：每个群各自记录已推送的新闻 id；
+        # _ad_seen 为全局判定结果（广告/平台推广，任何群都不推）。
+        self._ad_seen: set[str] = set()
+        self._pushed_by: dict[str, set[str]] = {}
         self._load_state()
 
         # ---- 数据源 ----
@@ -164,7 +167,7 @@ class CsNewsPlugin(Star):
                 break
 
     async def _poll_once(self) -> int:
-        """执行一次轮询，返回本轮实际推送条数。"""
+        """执行一次轮询，按目标群独立去重推送，返回本轮总推送条数。"""
         items = await self.source.fetch_news()
         if not items:
             logger.info("[cs_news] 新闻接口无可用条目")
@@ -183,7 +186,7 @@ class CsNewsPlugin(Star):
         for it in items:
             d = it.get("pub_dt")
             if d is None:
-                self._seen_ids.add(it["id"])
+                self._ad_seen.add(it["id"])
                 logger.debug("[cs_news] 跳过无发布时间条目: %s", it["title"])
                 continue
             if d >= cutoff:
@@ -200,19 +203,20 @@ class CsNewsPlugin(Star):
             self.lookback_hours,
             len(in_window),
         )
+        if not self._pushed_by:
+            for t in self.targets:
+                self._pushed_by.setdefault(t, set())
 
-        pending = [it for it in in_window if it["id"] not in self._seen_ids]
-        if not pending:
-            logger.debug("[cs_news] 暂无未推送的新新闻")
-            return 0
-
-        # 对候选逐条抓详情页：过滤 5E 平台广告 + 取官方摘要作概括素材。
-        # 广告会占用名额，候选多取 max_push*2 条，凑够 max_push 条真新闻即可。
-        ready: list[tuple[dict, str | None]] = []
+        # 对窗口内新闻做详情抓取：过滤 5E 广告 + 取官方摘要。
+        # 只对"尚有一个群未推送过且未判定过"的条目抓取，避免重复请求。
+        meta_cache: dict[str, tuple[bool, str | None]] = {}
+        summary_cache: dict[str, str] = {}
         ad_skipped = 0
-        for it in pending[: self.max_push * 2]:
-            if not self._running:
-                break
+        for it in in_window:
+            if it["id"] in self._ad_seen:
+                continue
+            if not any(it["id"] not in s for s in self._pushed_by.values()):
+                continue  # 所有群都已推送/已记录，无需再判定
             try:
                 is_news, official_summary = await self.source.fetch_article_meta(
                     it["link"]
@@ -226,68 +230,87 @@ class CsNewsPlugin(Star):
                 is_news, official_summary = True, None
             if not is_news:
                 ad_skipped += 1
-                # 广告/平台推广记入已推送集合，避免每轮重复请求
-                self._seen_ids.add(it["id"])
+                # 广告/平台推广记入全局，任何群都不推，避免每轮重复请求
+                self._ad_seen.add(it["id"])
                 logger.info(
                     "[cs_news] 跳过广告/平台推广: %s | %s", it["id"], it["title"]
                 )
                 continue
-            ready.append((it, official_summary))
-            if len(ready) >= self.max_push:
-                break
+            meta_cache[it["id"]] = (True, official_summary)
 
-        if not ready:
-            logger.info("[cs_news] 候选均为广告/平台推广，本轮无推送")
-            if ad_skipped:
-                self._save_state()
-            return 0
+        if ad_skipped:
+            self._save_state()
 
-        logger.info(
-            "[cs_news] 发现 %s 条待推送（已跳过 %s 条广告），本轮最多推送 %s 条",
-            len(ready),
-            ad_skipped,
-            self.max_push,
-        )
+        # 按群独立去重，逐群推送各自的未推送新闻
         pushed = 0
-        for it, official_summary in ready[: self.max_push]:
+        for target in self.targets:
             if not self._running:
                 break
-            # 1) LLM 概括（失败不计入已推送，下轮可重试）
-            try:
-                summary_zh = await self._summarize(it["title"], official_summary)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                self._consecutive_llm_fail += 1
-                logger.error("[cs_news] 新闻 %s 的 LLM 概括失败: %s", it["id"], e)
-                if self._consecutive_llm_fail >= self.fail_threshold:
-                    logger.error(
-                        "[cs_news] LLM 连续失败 %s 次，插件停用。", self.fail_threshold
-                    )
-                    self._running = False
+            seen = self._pushed_by.setdefault(target, set())
+            per_group = [
+                it
+                for it in in_window
+                if it["id"] in meta_cache
+                and it["id"] not in self._ad_seen
+                and it["id"] not in seen
+            ][: self.max_push]
+            if not per_group:
+                logger.debug("[cs_news] 目标 %s 无新增待推送", target)
                 continue
-            self._consecutive_llm_fail = 0
+            logger.info("[cs_news] 目标 %s 本轮待推送 %s 条", target, len(per_group))
+            for it in per_group:
+                if not self._running:
+                    break
+                # LLM 概括（同一新闻跨群复用缓存，只概括一次）
+                if it["id"] not in summary_cache:
+                    try:
+                        summary_zh = await self._summarize(
+                            it["title"], meta_cache[it["id"]][1]
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        self._consecutive_llm_fail += 1
+                        logger.error(
+                            "[cs_news] 新闻 %s 的 LLM 概括失败: %s", it["id"], e
+                        )
+                        if self._consecutive_llm_fail >= self.fail_threshold:
+                            logger.error(
+                                "[cs_news] LLM 连续失败 %s 次，插件停用。",
+                                self.fail_threshold,
+                            )
+                            self._running = False
+                        continue
+                    self._consecutive_llm_fail = 0
+                    summary_cache[it["id"]] = summary_zh
 
-            # 2) 推送（任一目标失败则不记 ID，下轮自动重试）
-            try:
-                ok = await self._push(it, summary_zh)
-                if not ok:
-                    logger.warning(
-                        "[cs_news] 新闻 %s 推送未全部成功，本轮不计入已推送，下轮重试",
-                        it["id"],
+                # 推送（该群失败则不记入该群，下轮重试）
+                try:
+                    ok = await self._push_to(target, it, summary_cache[it["id"]])
+                    if not ok:
+                        logger.warning(
+                            "[cs_news] 新闻 %s 推送 %s 未成功，不计入该群已推送，下轮重试",
+                            it["id"],
+                            target,
+                        )
+                        continue
+                    seen.add(it["id"])
+                    self._pushed_total += 1
+                    self._save_state()
+                    pushed += 1
+                    logger.info(
+                        "[cs_news] 已推送 %s: %s | %s", target, it["id"], it["title"]
                     )
-                    continue
-                self._seen_ids.add(it["id"])
-                self._pushed_total += 1
-                self._save_state()
-                pushed += 1
-                logger.info("[cs_news] 已推送: %s | %s", it["id"], it["title"])
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.error(
-                    "[cs_news] 推送新闻 %s 失败: %s", it["id"], e, exc_info=True
-                )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error(
+                        "[cs_news] 推送新闻 %s 到 %s 失败: %s",
+                        it["id"],
+                        target,
+                        e,
+                        exc_info=True,
+                    )
 
         return pushed
 
@@ -385,8 +408,8 @@ class CsNewsPlugin(Star):
         except Exception:
             return False
 
-    async def _push(self, item: dict, summary_zh: str) -> bool:
-        """组装消息链并推送到所有目标群。全部成功返回 True，任一目标失败返回 False。"""
+    async def _push_to(self, target: str, item: dict, summary_zh: str) -> bool:
+        """组装消息链并推送到单个目标群。成功返回 True。"""
         comps = []
         img_ok = False
         if self.enable_img and item.get("image"):
@@ -423,27 +446,24 @@ class CsNewsPlugin(Star):
         comps.append(Plain(text="\n".join(lines)))
 
         chain = MessageChain(chain=comps)
-        all_ok = True
-        for target in self.targets:
-            session = self._normalize_session(target)
-            try:
-                ok = await self.context.send_message(session, chain)
-            except Exception as e:
-                ok = False
-                logger.error(
-                    "[cs_news] 推送异常 session=%s: %s", session, e, exc_info=True
-                )
-            if not ok:
-                all_ok = False
-                logger.warning(
-                    "[cs_news] 无法匹配平台，消息未发送：目标=%s session=%s "
-                    "（检测到平台ID=%s，请确认 target_sessions 填纯群号即可，"
-                    "或填完整格式 <平台ID>:GroupMessage:<群号>）",
-                    target,
-                    session,
-                    self._platform_id or "(未检测到)",
-                )
-        return all_ok
+        session = self._normalize_session(target)
+        try:
+            ok = await self.context.send_message(session, chain)
+        except Exception as e:
+            ok = False
+            logger.error(
+                "[cs_news] 推送异常 session=%s: %s", session, e, exc_info=True
+            )
+        if not ok:
+            logger.warning(
+                "[cs_news] 无法匹配平台，消息未发送：目标=%s session=%s "
+                "（检测到平台ID=%s，请确认 target_sessions 填纯群号即可，"
+                "或填完整格式 <平台ID>:GroupMessage:<群号>）",
+                target,
+                session,
+                self._platform_id or "(未检测到)",
+            )
+        return ok
 
     def _grade_desc(self) -> str:
         """把数字等级映射为可读标签（如 1,2 -> S/A级）。"""
@@ -514,15 +534,35 @@ class CsNewsPlugin(Star):
                     path = old
             if path.exists():
                 data = json.loads(path.read_text(encoding="utf-8"))
-                self._seen_ids = set(data.get("seen_ids", []))
+                self._ad_seen = set(data.get("ad_seen", []))
+                raw_groups = data.get("per_group", {}) or {}
+                if raw_groups:
+                    self._pushed_by = {
+                        str(k): set(v) for k, v in raw_groups.items()
+                    }
+                else:
+                    # 迁移旧共享格式：旧 seen_ids 视为每个目标群都已推送过，
+                    # 保证改版后不会在任意群重复推送历史新闻
+                    legacy = set(data.get("seen_ids", []))
+                    if legacy:
+                        for t in self.targets:
+                            self._pushed_by.setdefault(t, set()).update(legacy)
+                if not self._pushed_by:
+                    for t in self.targets:
+                        self._pushed_by.setdefault(t, set())
                 self._pushed_total = int(data.get("pushed_total", 0))
         except Exception as e:
             logger.warning("[cs_news] 读取去重记录失败: %s", e)
 
     def _save_state(self):
         try:
-            ids = list(self._seen_ids)[-MAX_RECORD:]
-            payload = {"seen_ids": ids, "pushed_total": self._pushed_total}
+            payload = {
+                "ad_seen": list(self._ad_seen)[-MAX_RECORD:],
+                "per_group": {
+                    k: list(v)[-MAX_RECORD:] for k, v in self._pushed_by.items()
+                },
+                "pushed_total": self._pushed_total,
+            }
             self.state_path.write_text(
                 json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
             )
@@ -588,7 +628,9 @@ class CsNewsPlugin(Star):
                 f"赛事等级筛选：{','.join(self.match_grades)}（{grade_desc}）",
                 f"附今日赛事：{'开' if self.enable_match else '关'}",
                 f"已推送累计：{self._pushed_total} 条",
-                f"去重记录：{len(self._seen_ids)} 条",
+                f"去重记录：{len(self._ad_seen)} 条广告 + "
+                f"{sum(len(s) for s in self._pushed_by.values())} 条新闻",
+                f"各群已推送：{('，'.join(f'{t}:{len(s)}' for t, s in self._pushed_by.items())) or '(无)'}",
             ]
             yield event.plain_result("\n".join(lines))
             return
