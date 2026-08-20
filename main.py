@@ -40,12 +40,14 @@ from .fiveplay_api import CST, DEFAULT_UA, FivePlaySource
 
 MAX_RECORD = 300  # 去重记录最多保留的 ID 数（防膨胀）
 
-SYSTEM_PROMPT_TMPL = """你是 CS2（CSGO）电竞新闻的中文播报助手。请把给定的一条中文新闻标题，处理成一条面向中文读者的一句话播报。
+SYSTEM_PROMPT_TMPL = """你是 CS2（CSGO）电竞新闻的中文播报助手。你会收到一条新闻的「标题」和「官方摘要」，请基于两者写一句面向中文读者、信息密集的一句话播报。
 
 要求：
-1. 基于新闻标题理解新闻内容，用一句通顺、地道的简体中文（不超过 {max_chars} 个汉字）概括这条新闻的核心。
-2. 【最重要】必须原样保留标题中出现的选手 ID、昵称、真名、战队名、赛事名、平台名等专有名词，绝不强行改写或音译。例如 s1mple、ZywOo、m0NESY、MOUZ、FURIA、Natus Vincere、G2、FaZe、Vitality、电竞世俱杯 等保持原名。
-3. 只输出一个 JSON 对象，不要任何解释文字，不要 markdown 代码块标记。格式如下：
+1. 概括要包含具体信息（谁、什么事、结果/影响），写成一条完整的句子，不要写成标题的复述或简单扩写。
+2. 优先采用官方摘要里的事实细节，可以适度精简合并，总长度控制在不超过 {max_chars} 个汉字的一句话内。
+3. 【最重要】必须原样保留标题或摘要中出现的选手 ID、昵称、真名、战队名、赛事名、平台名等专有名词，绝不强行改写或音译。例如 s1mple、ZywOo、m0NESY、MOUZ、FURIA、Natus Vincere、G2、FaZe、Vitality、电竞世俱杯 等保持原名。
+4. 如果官方摘要已经是一句通顺完整的表述，直接采用或仅微调使其通顺，不要为了凑字数而加长。
+5. 只输出一个 JSON 对象，不要任何解释文字，不要 markdown 代码块标记。格式如下：
 {{"summary_zh": "中文概括"}}"""
 
 DEFAULT_GRADES = ["1", "2"]  # 默认只保留 S(1/2) 级赛事，可在配置中调整
@@ -179,18 +181,55 @@ class CsNewsPlugin(Star):
             logger.debug("[cs_news] 暂无未推送的新新闻")
             return 0
 
+        # 对候选逐条抓详情页：过滤 5E 平台广告 + 取官方摘要作概括素材。
+        # 广告会占用名额，候选多取 max_push*2 条，凑够 max_push 条真新闻即可。
+        ready: list[tuple[dict, str | None]] = []
+        ad_skipped = 0
+        for it in pending[: self.max_push * 2]:
+            if not self._running:
+                break
+            try:
+                is_news, official_summary = await self.source.fetch_article_meta(
+                    it["link"]
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(
+                    "[cs_news] 抓取详情 %s 失败，按新闻保守处理: %s", it["id"], e
+                )
+                is_news, official_summary = True, None
+            if not is_news:
+                ad_skipped += 1
+                # 广告/平台推广记入已推送集合，避免每轮重复请求
+                self._seen_ids.add(it["id"])
+                logger.info(
+                    "[cs_news] 跳过广告/平台推广: %s | %s", it["id"], it["title"]
+                )
+                continue
+            ready.append((it, official_summary))
+            if len(ready) >= self.max_push:
+                break
+
+        if not ready:
+            logger.info("[cs_news] 候选均为广告/平台推广，本轮无推送")
+            if ad_skipped:
+                self._save_state()
+            return 0
+
         logger.info(
-            "[cs_news] 发现 %s 条未推送新闻，本轮最多推送 %s 条",
-            len(pending),
+            "[cs_news] 发现 %s 条待推送（已跳过 %s 条广告），本轮最多推送 %s 条",
+            len(ready),
+            ad_skipped,
             self.max_push,
         )
         pushed = 0
-        for it in pending[: self.max_push]:
+        for it, official_summary in ready[: self.max_push]:
             if not self._running:
                 break
             # 1) LLM 概括（失败不计入已推送，下轮可重试）
             try:
-                summary_zh = await self._summarize(it["title"])
+                summary_zh = await self._summarize(it["title"], official_summary)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -240,16 +279,29 @@ class CsNewsPlugin(Star):
             return prov
         return await self.context.get_using_provider_async()
 
-    async def _summarize(self, title: str) -> str:
-        """调用 LLM：基于中文标题生成一句话中文概括。
+    async def _summarize(self, title: str, official_summary: str | None = None) -> str:
+        """调用 LLM：基于标题 + 5eplay 官方摘要生成一句话中文概括。
+
+        官方摘要是 5eplay 自写的新闻摘要（信息密集），LLM 负责润色/精简为
+        不超过 max_chars 的一句话，避免概括空泛或复述标题。无官方摘要时
+        退化为仅基于标题概括（详情抓取失败时的兜底）。
 
         通过 context.llm_generate() 直接调用 provider，不经过会话管理器，
         不会写入主对话历史，因此不影响主对话上下文。
         """
         system_prompt = SYSTEM_PROMPT_TMPL.format(max_chars=self.summary_chars)
-        user_prompt = (
-            f"新闻标题（中文）：{title}\n" "请按系统要求输出 JSON。"
-        )
+        if official_summary:
+            user_prompt = (
+                f"新闻标题（中文）：{title}\n"
+                f"官方摘要：{official_summary}\n"
+                "请按系统要求输出 JSON。"
+            )
+        else:
+            user_prompt = (
+                f"新闻标题（中文）：{title}\n"
+                "（无官方摘要，请基于标题概括）\n"
+                "请按系统要求输出 JSON。"
+            )
         resp = await self.context.llm_generate(
             chat_provider_id=self._provider_id_resolved,
             prompt=user_prompt,

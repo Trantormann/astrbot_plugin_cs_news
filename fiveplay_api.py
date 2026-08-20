@@ -13,6 +13,8 @@
 from __future__ import annotations
 
 import datetime
+import html
+import re
 from typing import Any
 
 import httpx
@@ -89,6 +91,47 @@ class FivePlaySource:
                 }
             )
         return items
+
+    async def fetch_article_meta(self, link: str) -> tuple[bool, str | None]:
+        """抓取文章详情页的 meta description，用于广告过滤与概括素材。
+
+        5eplay 对正文资讯页会写 `<meta name="description" content="CSGO新闻:...">`，
+        而平台自身的商城/活动推广页的 description 是固定的官网介绍文案。
+        因此：
+          - description 以 "CSGO新闻:" 开头 → 判为真新闻，返回 (True, 去前缀摘要)
+          - 其他情况（平台推广/广告）→ 返回 (False, None)
+
+        请求失败或页面无 description 时保守返回 (True, None)，绝不误删真新闻。
+
+        Returns:
+            tuple[bool, str | None]: (is_news, official_summary)
+        """
+        headers = {
+            "User-Agent": self.ua,
+            "Accept": "text/html,application/xhtml+xml,*/*",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        }
+        try:
+            async with httpx.AsyncClient(
+                follow_redirects=True, timeout=self.timeout, headers=headers
+            ) as client:
+                r = await client.get(link)
+            if r.status_code != 200:
+                return True, None
+            m = re.search(
+                r'<meta name="description" content="([^"]*)"', r.text, re.IGNORECASE
+            )
+            if not m:
+                return True, None
+            desc = html.unescape(m.group(1))
+            desc = re.sub(r"<[^>]+>", "", desc).strip()
+            if not desc:
+                return True, None
+            if desc.startswith("CSGO新闻:"):
+                return True, desc[len("CSGO新闻:") :].strip()
+            return False, None
+        except Exception:
+            return True, None
 
     # ---------------- 赛事 ----------------
 
