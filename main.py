@@ -336,6 +336,11 @@ class CsNewsPlugin(Star):
             logger.warning("[cs_news] 拉取今日赛事失败，忽略赛事部分: %s", e)
             return []
 
+    @staticmethod
+    def _display_width(s: str) -> int:
+        """估算显示宽度：全角/中文按 2 格计，用于对齐赛事对阵。"""
+        return sum(2 if ord(ch) > 0x2E7F else 1 for ch in s)
+
     # ---------------- 推送 ----------------
 
     async def _image_reachable(self, url: str) -> bool:
@@ -383,8 +388,11 @@ class CsNewsPlugin(Star):
                     groups.setdefault(m["tournament"] or "未知赛事", []).append(m)
                 for tt, ms in groups.items():
                     lines.append(f"[{tt}]")
-                    for m in ms:
-                        lines.append(f"{m['team1']} vs {m['team2']} {m['time_str']}")
+                    rows = [f"{m['team1']} vs {m['team2']}" for m in ms]
+                    width = max(self._display_width(r) for r in rows)
+                    for m, r in zip(ms, rows):
+                        pad = " " * (width - self._display_width(r))
+                        lines.append(f"{r}{pad} 🕒{m['time_str']}")
 
         comps.append(Plain(text="\n".join(lines)))
 
