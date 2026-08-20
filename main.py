@@ -86,6 +86,9 @@ class HltvNewsPlugin(Star):
         self._provider_id_resolved = ""
         self._consecutive_llm_fail = 0
         self._pushed_total = 0
+        self._platform_id = ""  # 运行时解析到的实际平台实例 ID（如 Iris）：
+        #    优先级：配置 platform_id > 事件学习(unified_msg_origin) > 自动探测 platform_insts
+        self.config_platform_id = str(self.config.get("platform_id", "") or "").strip()
 
     # ---------------- 生命周期 ----------------
 
@@ -100,6 +103,11 @@ class HltvNewsPlugin(Star):
             self._running = False
             return
         self._provider_id_resolved = prov.meta().id
+        self._platform_id = self._detect_platform_id()
+        if not self._platform_id:
+            logger.warning(
+                "[hltv_news] 未检测到可用平台实例 ID，纯群号将回退为 aiocqhttp"
+            )
         if not self.targets:
             logger.warning(
                 "[hltv_news] 未配置推送目标群（target_sessions），本轮播报将只记录日志、不推送。"
@@ -182,9 +190,15 @@ class HltvNewsPlugin(Star):
                 continue
             self._consecutive_llm_fail = 0
 
-            # 2) 推送（推送失败不记 ID，下轮自动重试）
+            # 2) 推送（任一目标失败则不记 ID，下轮自动重试）
             try:
-                await self._push(it, title_zh, summary_zh)
+                ok = await self._push(it, title_zh, summary_zh)
+                if not ok:
+                    logger.warning(
+                        "[hltv_news] 新闻 %s 推送未全部成功，本轮不计入已推送，下轮重试",
+                        it["id"],
+                    )
+                    continue
                 self._seen_ids.add(it["id"])
                 self._pushed_total += 1
                 self._save_state()
@@ -298,8 +312,8 @@ class HltvNewsPlugin(Star):
 
     # ---------------- 推送 ----------------
 
-    async def _push(self, item: dict, title_zh: str, summary_zh: str) -> None:
-        """组装消息链并推送到所有目标群。"""
+    async def _push(self, item: dict, title_zh: str, summary_zh: str) -> bool:
+        """组装消息链并推送到所有目标群。全部成功返回 True，任一目标失败返回 False。"""
         comps = []
         if self.enable_img and item.get("image"):
             comps.append(Image(file=item["image"]))
@@ -313,19 +327,62 @@ class HltvNewsPlugin(Star):
         comps.append(Plain(text="\n".join(lines)))
 
         chain = MessageChain(chain=comps)
+        all_ok = True
         for target in self.targets:
             session = self._normalize_session(target)
-            ok = await self.context.send_message(session, chain)
+            try:
+                ok = await self.context.send_message(session, chain)
+            except Exception as e:
+                ok = False
+                logger.error(
+                    "[hltv_news] 推送异常 session=%s: %s", session, e, exc_info=True
+                )
             if not ok:
-                logger.warning("[hltv_news] 无法匹配平台，消息未发送到 %s", target)
+                all_ok = False
+                logger.warning(
+                    "[hltv_news] 无法匹配平台，消息未发送：目标=%s session=%s "
+                    "（检测到平台ID=%s，请确认 target_sessions 填纯群号即可，"
+                    "或填完整格式 <平台ID>:GroupMessage:<群号>）",
+                    target,
+                    session,
+                    self._platform_id or "(未检测到)",
+                )
+        return all_ok
 
-    @staticmethod
-    def _normalize_session(target: str) -> str:
-        """纯数字群号 → 补全为 aiocqhttp 群会话 ID；其余按原样（完整会话 ID）。"""
+    def _normalize_session(self, target: str) -> str:
+        """纯数字群号 → 用实际平台 ID 补全为群会话；
+        缺平台段的 'GroupMessage:xxx' → 同样补全；
+        其余按原样（视为完整会话 ID）。"""
         target = target.strip()
+        pid = self.config_platform_id or self._platform_id or "aiocqhttp"
         if target.isdigit():
-            return f"aiocqhttp:GroupMessage:{target}"
+            return f"{pid}:GroupMessage:{target}"
+        if target.startswith("GroupMessage:"):
+            return f"{pid}:{target}"
         return target
+
+    def _detect_platform_id(self) -> str:
+        """探测实际平台实例 ID（platform.meta().id，如 'Iris'），供拼接会话使用。
+        优先 aiocqhttp 类型实例；没有则取第一个可用平台实例。"""
+        try:
+            insts = self.context.platform_manager.platform_insts
+        except Exception:
+            return ""
+        for inst in insts:
+            try:
+                meta = inst.meta()
+            except Exception:
+                continue
+            if meta.name == "aiocqhttp" and meta.id:
+                return meta.id
+        for inst in insts:
+            try:
+                meta = inst.meta()
+            except Exception:
+                continue
+            if meta.id:
+                return meta.id
+        return ""
 
     # ---------------- 持久化 ----------------
 
@@ -362,6 +419,14 @@ class HltvNewsPlugin(Star):
     @filter.command("hltv")
     async def hltv(self, event: AstrMessageEvent):
         """HLTV 新闻播报管理：/hltv push 立即轮询推送；/hltv status 查看状态。"""
+        # 事件学习：从本条真实事件（unified_msg_origin 形如 "Iris:GroupMessage:群号"）
+        # 提取该群所在平台的实例 ID，优先于自动探测，保证纯群号补全准确。
+        origin = getattr(event, "unified_msg_origin", "") or ""
+        if ":" in origin:
+            learned = origin.split(":", 1)[0]
+            if learned and learned != self._platform_id:
+                self._platform_id = learned
+                logger.info("[hltv_news] 已从事件学习平台 ID: %s", learned)
         args = (event.message_str or "").strip().split()
         action = args[1].lower() if len(args) > 1 else "status"
         if action == "push":
@@ -382,6 +447,7 @@ class HltvNewsPlugin(Star):
                 f"状态：{state}",
                 f"轮询间隔：{self.interval_min} 分钟",
                 f"LLM 提供商：{self._provider_id_resolved or '(未解析)'}",
+                f"平台 ID：{self._platform_id or '(未检测到)'}",
                 f"推送目标：{self.targets or '(未配置)'}",
                 f"已推送累计：{self._pushed_total} 条",
                 f"去重记录：{len(self._seen_ids)} 条",
